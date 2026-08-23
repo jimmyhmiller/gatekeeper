@@ -39,6 +39,11 @@ pub struct Config {
     /// to put the periodic things you want to manage alongside the gate.
     #[serde(default)]
     pub job: Vec<Job>,
+    /// Passkey (WebAuthn) settings. **Absent means passkeys are off entirely**:
+    /// no login page, no register surface, no new public route. Like `public`,
+    /// the safe state is the default and the capable state is opt-in.
+    #[serde(default)]
+    pub passkey: Option<PasskeyConfig>,
 }
 
 /// One scheduled job: a command run on a fixed interval by the gate's scheduler
@@ -64,6 +69,52 @@ pub struct Job {
     /// the gate's own environment. Optional.
     #[serde(default)]
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// Passkey (WebAuthn) settings.
+///
+/// A WebAuthn credential is bound to an *origin*, which is most of why passkeys
+/// are phishing-resistant and a bearer token is not: the credential simply will
+/// not sign for a site it was not enrolled against. That binding is `rp_id` +
+/// `origin`, and getting them wrong is the single most common way to end up with
+/// a login page that silently never works, so [`Config::validate`] checks the
+/// relationship between them at boot rather than at first login.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PasskeyConfig {
+    /// The Relying Party ID: the registrable domain, e.g.
+    /// `computer.jimmyhmiller.com`. No scheme, no port, no path.
+    pub rp_id: String,
+    /// The full origin browsers will see, e.g.
+    /// `https://computer.jimmyhmiller.com`. Must be HTTPS (except localhost)
+    /// and its host must be `rp_id` or a subdomain of it.
+    pub origin: String,
+    /// Display name for the credential. Single-user for now.
+    #[serde(default = "default_user_name")]
+    pub user_name: String,
+    /// How long a browser session cookie stays valid. Default 12 hours.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_secs: u64,
+    /// Where to keep `passkeys.json` (credentials, device-token hashes, the
+    /// session-signing key). Must be writable by the service: under
+    /// `ProtectSystem=strict` that means a systemd `StateDirectory=`.
+    #[serde(default = "default_state_dir")]
+    pub state_dir: PathBuf,
+    /// Apple app ids (`TEAMID.bundle.id`) allowed to share these passkeys via
+    /// associated domains. **Non-empty adds a PUBLIC route** at
+    /// `/.well-known/apple-app-site-association`, which is required by Apple
+    /// and contains only these ids. Empty (the default) serves nothing.
+    #[serde(default)]
+    pub apple_app_ids: Vec<String>,
+}
+
+fn default_user_name() -> String {
+    "gatekeeper".to_string()
+}
+fn default_session_ttl() -> u64 {
+    12 * 3600
+}
+fn default_state_dir() -> PathBuf {
+    PathBuf::from("/var/lib/gatekeeper")
 }
 
 /// One route: a path prefix that maps to either a static folder or a proxied
@@ -217,6 +268,49 @@ impl Config {
             }
         }
 
+        // Validate the passkey block if present. These are the mistakes that
+        // produce a login page which fails only in the browser, at 2am, with an
+        // opaque DOMException — so they are boot errors instead.
+        if let Some(pk) = &self.passkey {
+            if pk.rp_id.trim().is_empty() {
+                return Err(ConfigError("passkey.rp_id must not be empty".into()));
+            }
+            if pk.rp_id.contains("://") || pk.rp_id.contains('/') || pk.rp_id.contains(':') {
+                return Err(ConfigError(format!(
+                    "passkey.rp_id must be a bare domain, got {:?} (no scheme, port, or path)",
+                    pk.rp_id
+                )));
+            }
+            let origin = url_host_and_scheme(&pk.origin)?;
+            let (scheme, host) = origin;
+            let localhost = host == "localhost" || host == "127.0.0.1";
+            if scheme != "https" && !localhost {
+                return Err(ConfigError(format!(
+                    "passkey.origin must be https (got {:?}); WebAuthn refuses insecure origins",
+                    pk.origin
+                )));
+            }
+            // The RP ID must be the origin's host or a parent domain of it.
+            if host != pk.rp_id && !host.ends_with(&format!(".{}", pk.rp_id)) {
+                return Err(ConfigError(format!(
+                    "passkey.origin host {host:?} is not rp_id {:?} or a subdomain of it; \
+                     the browser will reject every ceremony",
+                    pk.rp_id
+                )));
+            }
+            if pk.session_ttl_secs == 0 {
+                return Err(ConfigError("passkey.session_ttl_secs must be > 0".into()));
+            }
+            for app in &pk.apple_app_ids {
+                // TEAMID.bundle.id — a missing team prefix is silently useless.
+                if !app.contains('.') || app.split('.').next().unwrap_or("").len() < 8 {
+                    return Err(ConfigError(format!(
+                        "passkey.apple_app_ids entry {app:?} should be TEAMID.bundle.id"
+                    )));
+                }
+            }
+        }
+
         // Validate jobs: non-empty name + command, a parseable interval, and no
         // duplicate names (so logs are unambiguous).
         let mut job_names: Vec<&str> = Vec::with_capacity(self.job.len());
@@ -250,6 +344,30 @@ impl Config {
     pub fn tls_enabled(&self) -> bool {
         self.tls_cert.is_some() && self.tls_key.is_some()
     }
+}
+
+/// Split an origin into (scheme, host) without pulling `url` into config
+/// validation. Deliberately strict: anything with a path or userinfo is a
+/// misconfiguration, not something to normalize away.
+fn url_host_and_scheme(origin: &str) -> Result<(String, String), ConfigError> {
+    let (scheme, rest) = origin
+        .split_once("://")
+        .ok_or_else(|| ConfigError(format!("passkey.origin {origin:?} has no scheme")))?;
+    if rest.contains('/') {
+        return Err(ConfigError(format!(
+            "passkey.origin {origin:?} must be scheme://host[:port] with no path"
+        )));
+    }
+    if rest.contains('@') {
+        return Err(ConfigError(format!(
+            "passkey.origin {origin:?} must not contain userinfo"
+        )));
+    }
+    if rest.is_empty() {
+        return Err(ConfigError(format!("passkey.origin {origin:?} has no host")));
+    }
+    let host = rest.split(':').next().unwrap_or(rest).to_string();
+    Ok((scheme.to_ascii_lowercase(), host.to_ascii_lowercase()))
 }
 
 /// Parse a human interval like `"15m"`, `"1h"`, `"30s"`, `"2d"`, or a bare

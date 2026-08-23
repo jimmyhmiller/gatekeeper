@@ -213,6 +213,137 @@ doesn't export `gk_describe` (added in ABI v2), exactly as it refuses one missin
 `gk_handle`. So the catalog can never contain an undocumented function. The symbol
 is only *called* when serving the catalog.
 
+## Passkeys
+
+The shared token is a **machine** credential: one string, valid from anywhere,
+and whoever holds it is you. Passkeys add the **human** credential next to it.
+A passkey is bound to this origin, so it cannot be phished or replayed to
+another host, and its private key lives in the Secure Enclave rather than in
+your shell history.
+
+Turn it on with a `[passkey]` block. **Absent, the whole feature is off** and
+none of the routes below exist — the same opt-in shape as `public = true`.
+
+```toml
+[passkey]
+rp_id  = "computer.jimmyhmiller.com"      # bare domain: no scheme, port, or path
+origin = "https://computer.jimmyhmiller.com"
+user_name = "jimmyhmiller"
+state_dir = "/var/lib/gatekeeper"         # must be writable by the service
+session_ttl_secs = 43200                  # 12h browser session
+# apple_app_ids = ["TEAMID.com.example.App"]   # see "Native apps" below
+```
+
+Under `ProtectSystem=strict` the service cannot write anywhere by default, so
+`state_dir` needs a systemd `StateDirectory=`:
+
+```ini
+# /etc/systemd/system/gatekeeper.service.d/30-state.conf
+[Service]
+StateDirectory=gatekeeper
+```
+
+Boot validates the relationship between `rp_id` and `origin` (https, and the
+origin host must be the RP ID or a subdomain of it), because getting that wrong
+produces a login page that fails only in the browser with an opaque exception.
+
+### Enrolling: registration is private
+
+Registration is **not** a public route. `/register` and everything under it
+requires the same auth as any other private route, so an unauthenticated caller
+has no path to enrolling a credential. Bootstrapping goes:
+
+1. Open `/login` and use **"Use the bootstrap token instead"**. This verifies
+   the shared token and mints a **session** — the raw token never lands in the
+   browser's cookie jar, which the documented `gatekeeper=<token>` cookie could
+   not avoid.
+2. You are now authenticated, so `/register` loads. Name the passkey, click
+   **Add a passkey**, approve with Touch ID.
+3. From then on `/login` signs you in with the passkey, and `/register` can add
+   more or revoke any of them.
+
+The token keeps working on every private route as break-glass, so a lost passkey
+never locks you out.
+
+### The command line
+
+A CLI cannot run a WebAuthn ceremony — passkeys need a browser or platform
+authenticator to sign the challenge. `bin/gatekeeper-login` therefore runs a
+**device-authorization flow**, the same shape `gh` and `docker` use:
+
+```sh
+$ gatekeeper-login
+
+  Your code:  MC5R-LHJF
+  Open:       https://computer.jimmyhmiller.com/login?code=MC5R-LHJF
+
+Waiting for you to approve it with your passkey...
+Logged in. Token stored in ~/.config/gatekeeper/token
+```
+
+You approve the code in a browser with your passkey; the CLI collects a
+**device token** of its own, stored 0600. Then:
+
+```sh
+curl -H "Authorization: Bearer $(gatekeeper-login --print)" https://host/analytics/summary
+```
+
+Device tokens are stored hashed, listed at `/register`, and revocable
+individually — which is the practical win over one shared secret. Also
+`--status`, `--logout`, `--host`.
+
+### Native apps
+
+A signed macOS/iOS app uses the *same* endpoints via
+`ASAuthorizationPlatformPublicKeyCredentialProvider`, sharing the same passkey
+as Safari through iCloud Keychain. The only server-side piece is the
+associated-domains file, which Apple requires be public:
+
+```toml
+apple_app_ids = ["TEAMID.com.example.App"]
+```
+
+That, and only that, makes the gate serve
+`/.well-known/apple-app-site-association`. With the list empty the file is not
+served at all and the route does not exist. The app needs the matching
+`webcredentials:<rp_id>` entitlement.
+
+(Registration uses `start_passkey_registration`, which hints
+`residentKey: discouraged`. Apple's platform authenticator creates a
+discoverable, iCloud-synced credential anyway, and the assertion sends
+`allowCredentials`, so both the browser and a native app complete the ceremony
+without relying on discoverability.)
+
+### What this adds to the exposure surface
+
+Exactly one thing: `/login` and its ceremony endpoints are public, because you
+cannot authenticate in order to earn the ability to authenticate. Every reserved
+built-in and its access now appears in the boot exposure report:
+
+```
+  BUILT-IN routes (reserved; config cannot override these):
+    private  /describe                 ->  self-describing API catalog
+    PUBLIC   /login                    ->  passkey sign-in page
+    PUBLIC   /login/challenge          ->  begin a passkey assertion
+    ...
+    private  /login/device/approve     ->  CLI device flow: approve a code
+    private  /register                 ->  enroll and revoke passkeys
+```
+
+Built-ins were previously invisible to that report, which was survivable while
+`/describe` was the only one and it was private. It stops being survivable the
+moment a public built-in exists, so the report now covers every path the gate
+answers on, from either source. The set of public built-ins is also pinned by a
+test, so widening it has to be a deliberate edit.
+
+Reserved paths are matched **before** the configured router, so no `[[route]]`
+can shadow the login page or re-point registration.
+
+`[passkey]` is read at startup only: the engine holds live ceremonies and
+pending device codes, and its identity is what browsers bound their credentials
+to. A `SIGHUP` with a changed `[passkey]` logs that a restart is needed rather
+than silently ignoring the edit. Routes, token, and cert still hot-reload.
+
 ## TLS and certificates
 
 For a public `https://` domain, browsers require a certificate signed by a
@@ -283,7 +414,11 @@ certificates.
    (`/admin/docs` public under `/admin` private) — the more specific route wins.
 4. **Constant-time token check** (`subtle`), so the token can't be recovered by
    timing. Header (`Authorization: Bearer`) takes precedence over cookie; a
-   present-but-wrong header is not silently bypassed by a good cookie.
+   present-but-wrong header is not silently bypassed by a good cookie. With
+   passkeys on there are three credential kinds (shared token, device token,
+   passkey session) and every one of them is checked without short-circuiting,
+   so the response time reveals neither which kind matched nor how many device
+   tokens exist.
 5. **Loud exposure report at every boot** listing every public and private route,
    so you can eyeball "did I mean to make these public?". Use `--check` to print
    it and validate the config without binding.
@@ -291,6 +426,11 @@ certificates.
 These are enforced in one place (`Router::decide`) and verified by a property
 test (`tests/safety.rs`) that asserts, over thousands of generated configs and
 paths, that **no private route is ever allowed without a valid token**.
+
+Adding passkeys did not widen that core. `Router::decide` still asks one yes/no
+question; all `auth::Verifier` does is give that question three ways to answer
+yes instead of one. `tests/safety.rs` is unchanged and still proves the
+property.
 
 ## CLI
 
@@ -304,7 +444,8 @@ gatekeeper --config <file> [--token-file <file>] [--check]
 
 ## Not included (by design)
 
-Rate limiting, multiple/per-route tokens, request logging to a sink,
-OIDC/accounts, in-process ACME. Add a tunnel or a terminator in front if you need
+Rate limiting, per-route tokens, request logging to a sink, OIDC/accounts,
+multi-user, in-process ACME. (Passkeys **are** included — see above — but for a
+single user; per-device tokens are the closest thing to multiple tokens.) Add a tunnel or a terminator in front if you need
 more. This stays a small, legible gate. (Config **is** hot-reloaded on `SIGHUP` —
 see [Adding functions live](#adding-functions-live-no-restart).)

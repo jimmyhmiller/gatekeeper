@@ -1,0 +1,103 @@
+#!/bin/sh
+# gatekeeper-login — get a device token for this machine, using the passkey in
+# your browser.
+#
+# A command line cannot run a WebAuthn ceremony: passkeys need a browser (or a
+# platform authenticator) to sign a challenge. So this does what gh and docker
+# do instead — asks the gate for a short code, you approve it in a browser with
+# your passkey, and this collects a per-device token of its own. The token is
+# revocable on its own at /register, and unlike the shared bootstrap token it
+# never had to be pasted anywhere.
+#
+#   gatekeeper-login                      log this machine in
+#   gatekeeper-login --print              print the stored token (for scripts)
+#   gatekeeper-login --status             check the stored token still works
+#   gatekeeper-login --logout             forget the stored token
+#   gatekeeper-login --host https://...   use a different gate (remembered)
+#
+# Once logged in:
+#   curl -H "Authorization: Bearer $(gatekeeper-login --print)" https://HOST/analytics/summary
+set -eu
+
+DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gatekeeper"
+TOKEN_FILE="$DIR/token"
+HOST_FILE="$DIR/host"
+DEFAULT_HOST="https://computer.jimmyhmiller.com"
+
+host=""
+action="login"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) host="${2:-}"; shift 2 ;;
+    --print) action="print"; shift ;;
+    --status) action="status"; shift ;;
+    --logout) action="logout"; shift ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "gatekeeper-login: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+[ -n "$host" ] || host=$(cat "$HOST_FILE" 2>/dev/null || echo "$DEFAULT_HOST")
+host=$(printf '%s' "$host" | sed 's:/*$::')
+
+# Pull one field out of a JSON object without depending on jq.
+jfield() { python3 -c 'import sys,json;print(json.load(sys.stdin).get(sys.argv[1],""))' "$1"; }
+
+case "$action" in
+  print)
+    [ -f "$TOKEN_FILE" ] || { echo "gatekeeper-login: not logged in; run gatekeeper-login" >&2; exit 1; }
+    cat "$TOKEN_FILE"; exit 0 ;;
+  logout)
+    rm -f "$TOKEN_FILE"; echo "Forgot the token for $host."; exit 0 ;;
+  status)
+    [ -f "$TOKEN_FILE" ] || { echo "Not logged in."; exit 1; }
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $(cat "$TOKEN_FILE")" "$host/describe")
+    if [ "$code" = "200" ]; then echo "Logged in to $host."; exit 0
+    else echo "Stored token is not accepted by $host (HTTP $code)."; exit 1; fi ;;
+esac
+
+mkdir -p "$DIR"; chmod 700 "$DIR"
+printf '%s\n' "$host" > "$HOST_FILE"
+
+start=$(curl -sS -X POST "$host/login/device/start")
+device_code=$(printf '%s' "$start" | jfield device_code)
+user_code=$(printf '%s' "$start" | jfield user_code)
+verify_url=$(printf '%s' "$start" | jfield verification_uri_complete)
+interval=$(printf '%s' "$start" | jfield interval)
+expires=$(printf '%s' "$start" | jfield expires_in)
+[ -n "$device_code" ] || { echo "gatekeeper-login: $host did not return a device code." >&2; exit 1; }
+
+echo
+echo "  Your code:  $user_code"
+echo "  Open:       $verify_url"
+echo
+# Best effort: open the browser for them. Silence is fine if neither exists.
+( command -v open >/dev/null 2>&1 && open "$verify_url" ) >/dev/null 2>&1 ||
+( command -v xdg-open >/dev/null 2>&1 && xdg-open "$verify_url" ) >/dev/null 2>&1 || true
+echo "Waiting for you to approve it with your passkey..."
+
+deadline=$(( $(date +%s) + ${expires:-900} ))
+while [ "$(date +%s)" -lt "$deadline" ]; do
+  sleep "${interval:-3}"
+  body=$(curl -sS -o /tmp/gk-poll.$$ -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    -d "{\"device_code\":\"$device_code\"}" "$host/login/device/poll")
+  case "$body" in
+    200)
+      token=$(jfield token < /tmp/gk-poll.$$)
+      rm -f /tmp/gk-poll.$$
+      umask 077; printf '%s\n' "$token" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
+      echo "Logged in. Token stored in $TOKEN_FILE"
+      echo
+      echo "Use it like:"
+      echo "  curl -H \"Authorization: Bearer \$(gatekeeper-login --print)\" $host/analytics/summary"
+      exit 0 ;;
+    202) : ;;  # authorization_pending: keep waiting
+    *)
+      echo "gatekeeper-login: $(jfield error < /tmp/gk-poll.$$ 2>/dev/null || echo "HTTP $body")" >&2
+      rm -f /tmp/gk-poll.$$; exit 1 ;;
+  esac
+done
+rm -f /tmp/gk-poll.$$
+echo "gatekeeper-login: timed out waiting for approval." >&2
+exit 1

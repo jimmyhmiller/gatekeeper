@@ -24,6 +24,16 @@ percent-encoding = "2"
 signal-hook = "0.4.4"
 libloading = "0.8"
 gatekeeper-abi = { path = "crates/gatekeeper-abi" }
+# Passkeys. webauthn-rs is pinned to the stable line (0.6 is a -dev release).
+# This is the dependency cost the README's "not included: in-process ACME"
+# paragraph was worried about; it is paid deliberately, for the human
+# credential, and it brings no async runtime with it.
+webauthn-rs = "0.5.5"
+url = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
 
 [dev-dependencies]
 proptest = "1.11.0"

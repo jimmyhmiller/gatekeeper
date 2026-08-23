@@ -11,9 +11,11 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use gatekeeper::auth::Authenticator;
+use gatekeeper::auth::{Authenticator, Verifier};
 use gatekeeper::config::{self, Config, Target};
 use gatekeeper::function::FunctionRegistry;
+use gatekeeper::login;
+use gatekeeper::passkey::PasskeyEngine;
 use gatekeeper::proxy;
 use gatekeeper::reply::Reply;
 use gatekeeper::route::{Match, Router};
@@ -21,8 +23,9 @@ use gatekeeper::schedule::Scheduler;
 use gatekeeper::serve;
 
 /// Reserved built-in meta route: a JSON catalog of every route and each
-/// function's self-description. Private (token required).
-const DESCRIBE_PATH: &str = "/describe";
+/// function's self-description. Private. Defined in `login::RESERVED` along
+/// with every other built-in, so the boot exposure report can enumerate them.
+use gatekeeper::login::DESCRIBE_PATH;
 
 struct Args {
     config: PathBuf,
@@ -66,7 +69,10 @@ fn parse_args() -> Result<Args, String> {
 /// reloads so already-loaded dylibs are not re-`dlopen`ed.
 struct Routing {
     router: Router,
-    auth: Option<Authenticator>,
+    /// All credential kinds in one place: bootstrap token, device tokens, and
+    /// passkey sessions. Widening authentication happens HERE and nowhere near
+    /// `Router::decide`, which still just asks "was auth ok?".
+    verifier: Verifier,
     unmatched_status: u16,
 }
 
@@ -81,6 +87,11 @@ struct Gate {
     /// Runs scheduled `[[job]]`s on their intervals. Persists across reloads;
     /// its `reload` is called with the new job set on each SIGHUP.
     scheduler: Scheduler,
+    /// The passkey subsystem, or `None` when `[passkey]` is absent from the
+    /// config (in which case none of the login/register routes exist at all).
+    /// Like `functions`, it lives here rather than in `Routing` so a SIGHUP
+    /// does not drop in-flight ceremonies or pending device codes.
+    passkeys: Option<Arc<PasskeyEngine>>,
 }
 
 impl Gate {
@@ -113,7 +124,16 @@ fn run() -> Result<(), String> {
         );
     }
 
-    print_exposure_report(&cfg, token.is_some());
+    // Build the passkey subsystem before anything binds, so a bad `[passkey]`
+    // block (unwritable state dir, rp_id that can never match the origin) is a
+    // startup error rather than a login page that mysteriously never works.
+    // Absent config -> None -> not a single login route exists.
+    let passkeys = match &cfg.passkey {
+        Some(pk) => Some(Arc::new(PasskeyEngine::new(pk)?)),
+        None => None,
+    };
+
+    print_exposure_report(&cfg, token.is_some(), passkeys.as_deref());
 
     if args.check {
         println!("\n--check: config valid. Not binding.");
@@ -121,9 +141,14 @@ fn run() -> Result<(), String> {
     }
 
     let gate = Arc::new(Gate {
-        routing: std::sync::Mutex::new(Arc::new(build_routing(&cfg, token.as_deref()))),
+        routing: std::sync::Mutex::new(Arc::new(build_routing(
+            &cfg,
+            token.as_deref(),
+            passkeys.clone(),
+        ))),
         functions: FunctionRegistry::new(),
         scheduler: Scheduler::new(),
+        passkeys,
     });
     // Start the scheduled jobs (if any). Re-applied on every config reload.
     gate.scheduler.reload(&cfg.job);
@@ -192,10 +217,14 @@ fn run() -> Result<(), String> {
 
 /// Build the hot-swappable [`Routing`] from a config and optional token. Used at
 /// boot and on every reload, so route/auth construction is identical both times.
-fn build_routing(cfg: &Config, token: Option<&str>) -> Routing {
+fn build_routing(
+    cfg: &Config,
+    token: Option<&str>,
+    passkeys: Option<Arc<PasskeyEngine>>,
+) -> Routing {
     Routing {
         router: Router::new(cfg.route.clone()),
-        auth: token.map(Authenticator::new),
+        verifier: Verifier::new(token.map(Authenticator::new), passkeys),
         unmatched_status: cfg.unmatched_status,
     }
 }
@@ -288,7 +317,24 @@ fn reload_once(
     //    swaps; workers snapshot each per-request, so the worst interleaving is a
     //    single request seeing new routing with the old server (or vice versa) —
     //    both valid states, never a torn one.
-    let new_routing = Arc::new(build_routing(&cfg, token.as_deref()));
+    // The passkey engine is NOT rebuilt on reload: it holds live ceremonies and
+    // pending device codes, and its identity (rp_id/origin) is what browsers
+    // bound their credentials to. Changing `[passkey]` therefore needs a real
+    // restart, and we say so loudly rather than silently ignoring the edit.
+    let passkey_changed = match (&cfg.passkey, gate.passkeys.as_ref()) {
+        (Some(new), Some(live)) => {
+            new.rp_id != live.config().rp_id || new.origin != live.config().origin
+        }
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
+    };
+    if passkey_changed {
+        eprintln!(
+            "gatekeeper: reload: [passkey] changed but passkeys are bound at startup; \
+             the RUNNING passkey config is unchanged. Restart to apply it."
+        );
+    }
+    let new_routing = Arc::new(build_routing(&cfg, token.as_deref(), gate.passkeys.clone()));
     {
         let mut guard = gate.routing.lock().unwrap();
         *guard = new_routing;
@@ -303,7 +349,7 @@ fn reload_once(
     // Re-apply scheduled jobs: stale job threads stop, the new set starts.
     gate.scheduler.reload(&cfg.job);
 
-    print_exposure_report(&cfg, token.is_some());
+    print_exposure_report(&cfg, token.is_some(), gate.passkeys.as_deref());
     println!("gatekeeper: reloaded config (SIGHUP) — routes + cert applied");
 }
 
@@ -347,28 +393,54 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
     // consistent even if a SIGHUP lands mid-request.
     let routing = gate.routing();
 
-    // Built-in meta route: a self-describing API catalog. Reserved path, always
-    // available, and PRIVATE — it requires the same token as any private route,
-    // because it enumerates every route (including private ones) and their
-    // functions' endpoints. Normalize first so `/describe/` etc. and
-    // any encoding match the same way the router would.
+    // Built-in reserved routes: the API catalog, and (when `[passkey]` is
+    // configured) the login, registration, and device-flow endpoints. These are
+    // matched BEFORE the configured router so no `[[route]]` can shadow the
+    // login page or re-point registration. Each one's access comes from the
+    // single table in `login::RESERVED`, which is also what the boot exposure
+    // report prints. Normalize first so `/login/` and any encoding resolve the
+    // same way the router would.
     if let Some(norm) = Router::normalize(path) {
-        if norm == DESCRIBE_PATH {
-            let authed = routing
-                .auth
-                .as_ref()
-                .map(|a| a.check_headers(request.headers()))
-                .unwrap_or(false);
-            let reply = if authed {
-                describe_catalog(gate, &routing)
-            } else {
-                // Unlike a normal private route's bare 401, the discovery
-                // endpoint explains HOW to authenticate (never the token itself)
-                // so a caller knows what to do next.
-                describe_auth_help()
-            };
-            let _ = reply.respond(request);
-            return;
+        if let Some(reserved) = login::lookup(&norm) {
+            // A path is only live if this configuration actually serves it:
+            // without `[passkey]` only `/describe` exists, and the Apple file
+            // only exists when app ids are configured.
+            let live = login::active(gate.passkeys.as_deref())
+                .iter()
+                .any(|r| r.path == reserved.path);
+            if live {
+                // Same gate as any private route, evaluated the same way.
+                let authed = routing.verifier.check_headers(request.headers());
+                if !reserved.public && !authed {
+                    let reply = if reserved.path == DESCRIBE_PATH {
+                        // Unlike a normal private route's bare 401, the
+                        // discovery endpoint explains HOW to authenticate
+                        // (never the token itself) so a caller knows what next.
+                        describe_auth_help()
+                    } else {
+                        Reply::status(401, "Unauthorized")
+                            .with_header("WWW-Authenticate", "Bearer")
+                    };
+                    let _ = reply.respond(request);
+                    return;
+                }
+                let reply = if reserved.path == DESCRIBE_PATH {
+                    describe_catalog(gate, &routing)
+                } else {
+                    // `live` implies the engine exists for every non-describe
+                    // reserved path, because `active()` filters on exactly that.
+                    let engine = gate
+                        .passkeys
+                        .as_ref()
+                        .expect("non-describe reserved path implies a passkey engine");
+                    let method = request.method().as_str().to_string();
+                    let mut body = Vec::new();
+                    let _ = request.as_reader().read_to_end(&mut body);
+                    login::handle(engine, &routing.verifier, &method, &norm, &body)
+                };
+                let _ = reply.respond(request);
+                return;
+            }
         }
     }
 
@@ -378,11 +450,7 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
         Match::Route { route, rest, .. } => {
             // The safety gate: private routes require a valid token.
             if !route.public {
-                let ok = routing
-                    .auth
-                    .as_ref()
-                    .map(|a| a.check_headers(request.headers()))
-                    .unwrap_or(false);
+                let ok = routing.verifier.check_headers(request.headers());
                 if !ok {
                     let r = Reply::status(401, "Unauthorized")
                         .with_header("WWW-Authenticate", "Bearer");
@@ -424,7 +492,11 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
 
 /// Print, at every boot, exactly what is and isn't exposed — so a human can
 /// eyeball "did I mean to make these public?".
-fn print_exposure_report(cfg: &Config, token_configured: bool) {
+fn print_exposure_report(
+    cfg: &Config,
+    token_configured: bool,
+    passkeys: Option<&PasskeyEngine>,
+) {
     let line = "=".repeat(60);
     println!("\n{line}\nGATEKEEPER EXPOSURE REPORT\n{line}");
     if !cfg.tls_enabled() {
@@ -455,6 +527,47 @@ fn print_exposure_report(cfg: &Config, token_configured: bool) {
     }
     for r in &private {
         println!("    {}  ->  {}", r.path, target_desc(r));
+    }
+
+    // Built-in routes were previously invisible here, which was survivable while
+    // `/describe` was the only one and it was private. It stops being
+    // survivable the moment a PUBLIC built-in exists, so the report now covers
+    // every path the gate answers on, from either source.
+    let builtins = login::active(passkeys);
+    println!("\n  BUILT-IN routes (reserved; config cannot override these):");
+    for r in &builtins {
+        println!(
+            "    {:<8} {}  ->  {}",
+            if r.public { "PUBLIC" } else { "private" },
+            r.path,
+            r.desc
+        );
+    }
+
+    println!("\n  PASSKEYS:");
+    match passkeys {
+        None => println!("    off (no [passkey] section) — no login or register routes exist"),
+        Some(p) => {
+            let c = p.config();
+            println!("    rp_id {}  origin {}", c.rp_id, c.origin);
+            println!("    state {}", c.state_dir.display());
+            println!(
+                "    session TTL {}s, {} enrolled, {} device token(s) issued",
+                c.session_ttl_secs,
+                p.credential_count(),
+                p.device_summary().len()
+            );
+            if p.credential_count() == 0 {
+                println!(
+                    "    NOTE: none enrolled yet — sign in at /login with the bootstrap \
+                     token, then enroll at /register"
+                );
+            }
+            match p.apple_app_site_association() {
+                Some(_) => println!("    apple app ids: {}", c.apple_app_ids.join(", ")),
+                None => println!("    apple app ids: (none) — associated-domains file not served"),
+            }
+        }
     }
 
     println!("\n  SCHEDULED jobs:");

@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sign in</title>
+<style>
+:root { color-scheme: light dark; --fg:#111; --bg:#fafafa; --card:#fff; --line:#ddd; --muted:#666; --accent:#0b5fff; }
+@media (prefers-color-scheme: dark) { :root { --fg:#e8e8e8; --bg:#131313; --card:#1c1c1c; --line:#333; --muted:#999; --accent:#5b9bff; } }
+* { box-sizing: border-box; }
+body { margin:0; min-height:100vh; display:grid; place-items:center; background:var(--bg); color:var(--fg);
+  font:15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; padding:24px; }
+.card { width:100%; max-width:26rem; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:28px; }
+h1 { margin:0 0 4px; font-size:1.15rem; }
+p.sub { margin:0 0 22px; color:var(--muted); font-size:.9rem; }
+button { width:100%; padding:11px 14px; font:inherit; font-weight:600; border:0; border-radius:8px;
+  background:var(--accent); color:#fff; cursor:pointer; }
+button:hover { filter:brightness(1.08); }
+button.secondary { background:transparent; color:var(--accent); border:1px solid var(--line); font-weight:500; }
+button[disabled] { opacity:.55; cursor:default; }
+input { width:100%; padding:10px 12px; font:inherit; border:1px solid var(--line); border-radius:8px;
+  background:var(--bg); color:var(--fg); margin-bottom:10px; }
+.row { margin-top:14px; }
+.msg { margin-top:16px; padding:10px 12px; border-radius:8px; font-size:.88rem; display:none; }
+.msg.err { display:block; background:rgba(200,40,40,.12); color:#c62828; }
+.msg.ok  { display:block; background:rgba(20,150,70,.12); color:#1b8a4b; }
+details { margin-top:20px; border-top:1px solid var(--line); padding-top:14px; }
+summary { cursor:pointer; color:var(--muted); font-size:.85rem; }
+.code { font:600 1.6rem/1.2 ui-monospace, SFMono-Regular, Menlo, monospace; letter-spacing:.08em;
+  text-align:center; padding:14px; border:1px dashed var(--line); border-radius:8px; margin:14px 0; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1 id="title">Sign in</h1>
+  <p class="sub" id="subtitle">Use the passkey on this device.</p>
+
+  <div id="devicebox" hidden>
+    <p class="sub" style="margin-bottom:6px">A command line client is asking for access with this code. Check that it matches what your terminal is showing.</p>
+    <div class="code" id="devicecode"></div>
+    <input id="devicelabel" placeholder="Name this device (e.g. laptop cli)" autocomplete="off">
+  </div>
+
+  <button id="passkey">Continue with passkey</button>
+
+  <div class="msg" id="msg"></div>
+
+  <details id="fallback">
+    <summary>Use the bootstrap token instead</summary>
+    <p class="sub" style="margin:12px 0 8px">The shared token still works as a way in, so a lost passkey never locks you out. Registering a passkey requires this the first time.</p>
+    <input id="token" type="password" placeholder="Bootstrap token" autocomplete="off">
+    <button class="secondary" id="tokenbtn">Sign in with token</button>
+  </details>
+</div>
+<script src="/login/webauthn.js"></script>
+<script>
+const params = new URLSearchParams(location.search);
+const deviceCode = params.get("code");
+const msg = document.getElementById("msg");
+const passkeyBtn = document.getElementById("passkey");
+
+function show(kind, text) { msg.className = "msg " + kind; msg.textContent = text; }
+function clear() { msg.className = "msg"; msg.textContent = ""; }
+
+if (deviceCode) {
+  document.getElementById("title").textContent = "Approve device";
+  document.getElementById("subtitle").textContent =
+    "Confirm this code, then approve with your passkey.";
+  document.getElementById("devicebox").hidden = false;
+  document.getElementById("devicecode").textContent = deviceCode;
+  passkeyBtn.textContent = "Approve with passkey";
+}
+
+if (!window.PublicKeyCredential) {
+  show("err", "This browser does not support passkeys. Use the bootstrap token below.");
+  passkeyBtn.disabled = true;
+  document.getElementById("fallback").open = true;
+}
+
+// After any successful sign-in: either approve the waiting CLI, or go home.
+async function afterAuth() {
+  if (!deviceCode) { location.href = "/"; return; }
+  const label = document.getElementById("devicelabel").value;
+  await postJSON("/login/device/approve", { user_code: deviceCode, label: label });
+  show("ok", "Device approved. You can go back to your terminal.");
+  passkeyBtn.disabled = true;
+}
+
+passkeyBtn.addEventListener("click", async () => {
+  clear();
+  passkeyBtn.disabled = true;
+  try {
+    const start = await postJSON("/login/challenge", {});
+    const publicKey = decodeOptions(start.options.publicKey);
+    const cred = await navigator.credentials.get({ publicKey });
+    if (!cred) throw new Error("no credential returned");
+    await postJSON("/login/verify", {
+      ceremony: start.ceremony,
+      credential: encodeCredential(cred),
+    });
+    await afterAuth();
+  } catch (e) {
+    show("err", e.message || String(e));
+    passkeyBtn.disabled = false;
+  }
+});
+
+document.getElementById("tokenbtn").addEventListener("click", async () => {
+  clear();
+  const token = document.getElementById("token").value.trim();
+  if (!token) { show("err", "Enter the token first."); return; }
+  try {
+    await postJSON("/login/token", { token });
+    await afterAuth();
+  } catch (e) {
+    show("err", "That token was not accepted.");
+  }
+});
+</script>
+</body>
+</html>
