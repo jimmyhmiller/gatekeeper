@@ -10,6 +10,7 @@
 //! fixed length first, which removes the length-dependent early return that a
 //! naive `ct_eq` on differing lengths would otherwise have.
 
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 /// Holds the expected token in a form that compares in constant time.
@@ -188,41 +189,20 @@ impl Verifier {
     }
 }
 
-/// SHA-256-style fixed-length digest. We don't pull in a crypto hash crate for
-/// this — a token equality check only needs a fixed-width, well-mixed reduction
-/// so the constant-time compare has no length side channel. FxHash-style
-/// mixing over 4 lanes is more than enough to avoid collisions for this use
-/// (an attacker who can find a 256-bit multi-lane collision has already won
-/// elsewhere). The point is constant-time *comparison*, not hash secrecy.
+/// Fixed-length digest of a presented token, so the constant-time compare has
+/// no length side channel.
+///
+/// This was a hand-rolled 4-lane FNV/splitmix mixer, on the reasoning that a
+/// token equality check only needs a fixed-width reduction and not hash
+/// secrecy. That reasoning is true as far as it goes, but the bootstrap token
+/// is the highest-value credential here (it is what enrolls the first passkey),
+/// this same file already depends on SHA-256 for device tokens and HMAC-SHA256
+/// for sessions, and a hand-rolled mixer has no analyzed preimage or collision
+/// resistance. There was no upside to keeping it.
 fn digest(bytes: &[u8]) -> [u8; 32] {
-    // Four independent 64-bit accumulators with distinct primes, each folded
-    // over the whole input, then serialized. This is deterministic and
-    // fixed-length regardless of input length.
-    const SEEDS: [u64; 4] = [
-        0x100000001b3,
-        0xff51afd7ed558ccd,
-        0xc4ceb9fe1a85ec53,
-        0x9e3779b97f4a7c15,
-    ];
-    let mut acc = SEEDS;
-    for (i, &b) in bytes.iter().enumerate() {
-        let lane = i % 4;
-        acc[lane] = (acc[lane] ^ b as u64).wrapping_mul(0x100000001b3);
-        // rotate to spread influence across lanes
-        acc[(lane + 1) % 4] = acc[(lane + 1) % 4].rotate_left(7) ^ acc[lane];
-    }
-    // Final avalanche per lane (splitmix64-style).
-    for a in acc.iter_mut() {
-        let mut x = *a ^ (bytes.len() as u64).wrapping_mul(0x9e3779b97f4a7c15);
-        x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-        *a = x ^ (x >> 31);
-    }
-    let mut out = [0u8; 32];
-    for (i, a) in acc.iter().enumerate() {
-        out[i * 8..i * 8 + 8].copy_from_slice(&a.to_le_bytes());
-    }
-    out
+    let mut h = Sha256::new();
+    h.update(bytes);
+    h.finalize().into()
 }
 
 #[cfg(test)]

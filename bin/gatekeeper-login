@@ -79,13 +79,20 @@ echo "Waiting for you to approve it with your passkey..."
 deadline=$(( $(date +%s) + ${expires:-900} ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep "${interval:-3}"
-  body=$(curl -sS -o /tmp/gk-poll.$$ -w '%{http_code}' -X POST \
+  # Body and status both come back in one variable. An earlier version wrote
+  # the response to /tmp/gk-poll.$$ — a predictable name in a world-writable
+  # directory, created with curl's default permissions, holding the bearer
+  # token. That was both a disclosure window for anyone who could guess the PID
+  # and a symlink-preplacement target for `curl -o`. The token now never
+  # touches the disk except as the final 0600 file.
+  resp=$(curl -sS -w '\n%{http_code}' -X POST \
     -H 'Content-Type: application/json' \
     -d "{\"device_code\":\"$device_code\"}" "$host/login/device/poll")
+  body=$(printf '%s\n' "$resp" | tail -n 1)
+  payload=$(printf '%s\n' "$resp" | sed '$d')
   case "$body" in
     200)
-      token=$(jfield token < /tmp/gk-poll.$$)
-      rm -f /tmp/gk-poll.$$
+      token=$(printf '%s' "$payload" | jfield token)
       umask 077; printf '%s\n' "$token" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"
       echo "Logged in. Token stored in $TOKEN_FILE"
       echo
@@ -94,10 +101,11 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
       exit 0 ;;
     202) : ;;  # authorization_pending: keep waiting
     *)
-      echo "gatekeeper-login: $(jfield error < /tmp/gk-poll.$$ 2>/dev/null || echo "HTTP $body")" >&2
-      rm -f /tmp/gk-poll.$$; exit 1 ;;
+      reason=$(printf '%s' "$payload" | jfield error 2>/dev/null || true)
+      [ -n "$reason" ] || reason="HTTP $body"
+      echo "gatekeeper-login: $reason" >&2
+      exit 1 ;;
   esac
 done
-rm -f /tmp/gk-poll.$$
 echo "gatekeeper-login: timed out waiting for approval." >&2
 exit 1

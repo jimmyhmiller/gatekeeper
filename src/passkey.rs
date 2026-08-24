@@ -28,7 +28,7 @@
 //! three ways to become true instead of one.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -131,6 +131,13 @@ impl PasskeyEngine {
         let dir = &cfg.state_dir;
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("creating passkey state dir {}: {e}", dir.display()))?;
+        // 0700, not the 0755 create_dir_all defaults to: nothing outside the
+        // service has business traversing the credential store.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+                .map_err(|e| format!("chmod 700 {}: {e}", dir.display()))?;
+        }
         let path = dir.join("passkeys.json");
 
         let mut store: StoreFile = match std::fs::read(&path) {
@@ -191,9 +198,30 @@ impl PasskeyEngine {
         };
         // Write-then-rename so a crash mid-write cannot truncate the credential
         // store and lock us out.
+        //
+        // The temp file is created 0600 *from the outset* rather than chmod'd
+        // after the write. It holds `session_key`, the HMAC secret that forges
+        // any session cookie, and a plain `fs::write` would leave it
+        // world-readable for the length of the write — a local race with a
+        // permanent payoff, since the key only changes if someone edits the
+        // store by hand.
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let tmp = self.path.with_extension("json.tmp");
-        std::fs::write(&tmp, &bytes).map_err(|e| format!("writing {}: {e}", tmp.display()))?;
-        restrict(&tmp)?;
+        // Remove first: `mode()` only applies when the file is created, so
+        // reusing a leftover temp file would silently keep its old permissions.
+        let _ = std::fs::remove_file(&tmp);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("creating {}: {e}", tmp.display()))?;
+        f.write_all(&bytes)
+            .map_err(|e| format!("writing {}: {e}", tmp.display()))?;
+        f.sync_all()
+            .map_err(|e| format!("syncing {}: {e}", tmp.display()))?;
+        drop(f);
         std::fs::rename(&tmp, &self.path)
             .map_err(|e| format!("renaming into {}: {e}", self.path.display()))?;
         Ok(())
@@ -635,13 +663,6 @@ fn random_user_code() -> Result<String, String> {
     Ok(format!("{}-{}", &s[..4], &s[4..]))
 }
 
-/// chmod 0600. The state file holds credential public keys and token hashes:
-/// not directly usable, but not something to leave world-readable either.
-fn restrict(path: &Path) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|e| format!("chmod 600 {}: {e}", path.display()))
-}
 
 #[cfg(test)]
 mod tests {
