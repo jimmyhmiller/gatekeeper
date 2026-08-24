@@ -7,6 +7,7 @@ pub mod function;
 pub mod login;
 pub mod passkey;
 pub mod proxy;
+pub mod ratelimit;
 pub mod reply;
 pub mod route;
 pub mod schedule;

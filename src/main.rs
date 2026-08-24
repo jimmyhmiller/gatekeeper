@@ -17,6 +17,7 @@ use gatekeeper::function::FunctionRegistry;
 use gatekeeper::login;
 use gatekeeper::passkey::PasskeyEngine;
 use gatekeeper::proxy;
+use gatekeeper::ratelimit::RateLimiter;
 use gatekeeper::reply::Reply;
 use gatekeeper::route::{Match, Router};
 use gatekeeper::schedule::Scheduler;
@@ -91,6 +92,9 @@ struct Gate {
     /// Runs scheduled `[[job]]`s on their intervals. Persists across reloads;
     /// its `reload` is called with the new job set on each SIGHUP.
     scheduler: Scheduler,
+    /// Per-client budgets for the public auth endpoints. Lives here, not in
+    /// `Routing`, so a config reload does not hand an attacker a fresh budget.
+    limiter: RateLimiter,
     /// The passkey subsystem, or `None` when `[passkey]` is absent from the
     /// config (in which case none of the login/register routes exist at all).
     /// Like `functions`, it lives here rather than in `Routing` so a SIGHUP
@@ -152,6 +156,7 @@ fn run() -> Result<(), String> {
         ))),
         functions: FunctionRegistry::new(),
         scheduler: Scheduler::new(),
+        limiter: RateLimiter::new(),
         passkeys,
     });
     // Start the scheduled jobs (if any). Re-applied on every config reload.
@@ -442,7 +447,20 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                     let method = request.method().as_str().to_string();
                     let mut body = Vec::new();
                     let _ = request.as_reader().read_to_end(&mut body);
-                    login::handle(engine, &routing.verifier, &method, &norm, &body)
+                    // The TCP peer address. Not X-Forwarded-For: gatekeeper
+                    // terminates TLS itself, so the peer IS the client, and
+                    // trusting a client-supplied header would make the limiter
+                    // bypassable by setting it.
+                    let client = request.remote_addr().map(|a| a.ip());
+                    login::handle(
+                        engine,
+                        &routing.verifier,
+                        &gate.limiter,
+                        client,
+                        &method,
+                        &norm,
+                        &body,
+                    )
                 };
                 let _ = reply.respond(request);
                 return;

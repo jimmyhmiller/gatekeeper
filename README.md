@@ -293,12 +293,49 @@ has no path to enrolling a credential. Bootstrapping goes:
 The token keeps working on every private route as break-glass, so a lost passkey
 never locks you out.
 
+### Rate limiting the public endpoints
+
+Adding passkeys put a credential check on a public path for the first time
+(`/login/token`), and constant-time comparison stops a token being recovered
+byte-by-byte but does nothing about unlimited guesses. So four reserved paths
+are rate limited per client, and nothing else is:
+
+| path | budget |
+|------|--------|
+| `/login/token` | 10 per 5 min, its own bucket |
+| `/login/verify`, `/login/challenge`, `/login/device/start` | 30 per min, shared |
+
+Over budget is `429` with `Retry-After`. A successful sign-in clears that
+client's budget, so the credential limit is really "failures in a row".
+
+**The bootstrap token has its own bucket on purpose.** Sharing one with the
+passkey path would mean fat-fingering the token ten times also locks you out of
+your passkey, which is the stronger credential and the one that should still
+work — and it would hand an attacker a cheap denial of service: trip the shared
+bucket deliberately and the real user cannot get in either way.
+
+The client is the TCP peer address. `X-Forwarded-For` is deliberately **not**
+consulted: gatekeeper terminates TLS itself, so the peer is the client, and
+trusting a client-supplied header would make the limiter bypassable by setting
+it. There are also hard ceilings on in-flight ceremonies and device requests,
+which catch the case per-client limiting cannot see: many clients each staying
+under the limit.
+
+### Signing out
+
 **Signing out** is `/logout` (linked from `/register`). It expires both the
 passkey session and the break-glass `gatekeeper=<token>` cookie and redirects to
 `/login`. There is no session table to delete, because sessions are signed
 rather than stored, so this is purely cookie expiry. It is public on purpose: if
 signing out required being signed in, a stale or half-broken cookie would be
 impossible to clear.
+
+**Sign out everywhere** is the button at the bottom of `/register`. Being
+signed rather than stored is what keeps sessions cheap, but it also means an
+individual session cannot be revoked. Rotating the signing key is the kill
+switch: every outstanding session on every device dies at once, including the
+one that pressed the button. Device tokens and the bootstrap token are
+unaffected, so your CLI and cron jobs keep working.
 
 ### The command line
 
@@ -479,8 +516,10 @@ gatekeeper --config <file> [--token-file <file>] [--check]
 
 ## Not included (by design)
 
-Rate limiting, per-route tokens, request logging to a sink, OIDC/accounts,
-multi-user, in-process ACME. (Passkeys **are** included — see above — but for a
-single user; per-device tokens are the closest thing to multiple tokens.) Add a tunnel or a terminator in front if you need
+General request rate limiting, per-route tokens, request logging to a sink,
+OIDC/accounts, multi-user, in-process ACME. (Passkeys **are** included — see
+above — but for a single user; per-device tokens are the closest thing to
+multiple tokens. Rate limiting is now present, but *only* on the four public
+authentication endpoints, and it should stay that narrow.) Add a tunnel or a terminator in front if you need
 more. This stays a small, legible gate. (Config **is** hot-reloaded on `SIGHUP` —
 see [Adding functions live](#adding-functions-live-no-restart).)

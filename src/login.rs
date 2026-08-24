@@ -13,8 +13,11 @@
 //! ability to authenticate) and it is the entire new exposure surface of the
 //! passkey feature. Registration is **not** in that set.
 
+use std::net::IpAddr;
+
 use crate::auth::Verifier;
 use crate::passkey::PasskeyEngine;
+use crate::ratelimit::{RateLimiter, CEREMONY, CREDENTIAL};
 use crate::reply::Reply;
 
 /// A built-in path the gate answers itself.
@@ -44,6 +47,7 @@ pub const RESERVED: &[Reserved] = &[
     Reserved { path: "/register/challenge", public: false, desc: "begin enrolling a passkey" },
     Reserved { path: "/register/verify", public: false, desc: "finish enrolling a passkey" },
     Reserved { path: "/register/revoke", public: false, desc: "revoke a credential" },
+    Reserved { path: "/register/revoke-sessions", public: false, desc: "sign out every device" },
     Reserved { path: APPLE_AASA, public: true, desc: "Apple associated domains (native app)" },
 ];
 
@@ -110,6 +114,8 @@ fn html(body: &'static str) -> Reply {
 pub fn handle(
     engine: &PasskeyEngine,
     verifier: &Verifier,
+    limiter: &RateLimiter,
+    client: Option<IpAddr>,
     method: &str,
     path: &str,
     body: &[u8],
@@ -122,6 +128,33 @@ pub fn handle(
     );
     if want_post && method != "POST" {
         return err(405, "method not allowed");
+    }
+
+    // Rate limit the public endpoints that either check a credential or
+    // allocate server-side state. Applied before parsing the body, so a flood
+    // costs us a hash-map lookup and nothing else.
+    // The bootstrap token gets its own bucket, separate from the passkey path.
+    // Sharing one would mean that fat-fingering the token ten times also locks
+    // you out of signing in with your passkey — which is the stronger
+    // credential and the one that should still work. It would also hand an
+    // attacker a cheap denial of service: trip the shared bucket deliberately
+    // and the real user cannot get in either way.
+    //
+    // /login/verify sits in the ceremony bucket, not the credential one:
+    // failing it means failing to produce a valid WebAuthn signature, which is
+    // not a guessing attack, so the only thing worth bounding there is spam.
+    let limited = match path {
+        "/login/token" => Some(("token", &CREDENTIAL)),
+        "/login/verify" | "/login/challenge" | "/login/device/start" => {
+            Some(("ceremony", &CEREMONY))
+        }
+        _ => None,
+    };
+    if let Some((bucket, policy)) = limited {
+        if let Some(retry) = limiter.check(client, bucket, policy) {
+            return json(429, serde_json::json!({ "error": "too_many_requests" }))
+                .with_header("Retry-After", &retry.as_secs().max(1).to_string());
+        }
     }
 
     let parsed: serde_json::Value = if body.is_empty() {
@@ -180,8 +213,11 @@ pub fn handle(
                 Err(e) => return err(400, &format!("malformed credential: {e}")),
             };
             match engine.finish_authentication(&ceremony, credential) {
-                Ok(token) => json(200, serde_json::json!({ "ok": true }))
-                    .with_header("Set-Cookie", &engine.session_cookie(&token)),
+                Ok(token) => {
+                    limiter.reset(client, "ceremony");
+                    json(200, serde_json::json!({ "ok": true }))
+                        .with_header("Set-Cookie", &engine.session_cookie(&token))
+                }
                 Err(e) => err(401, &e),
             }
         }
@@ -194,6 +230,7 @@ pub fn handle(
             if presented.is_empty() || !verifier.verify_bootstrap(&presented) {
                 return err(401, "invalid token");
             }
+            limiter.reset(client, "token");
             let session = engine.mint_session_for_bootstrap();
             json(200, serde_json::json!({ "ok": true }))
                 .with_header("Set-Cookie", &engine.session_cookie(&session))
@@ -259,6 +296,14 @@ pub fn handle(
                 Err(e) => err(400, &e),
             }
         }
+        // Rotating the signing key invalidates every session everywhere,
+        // including this caller's, so we also expire their cookie rather than
+        // leaving the browser holding one that will simply fail from now on.
+        "/register/revoke-sessions" => match engine.rotate_session_key() {
+            Ok(()) => json(200, serde_json::json!({ "ok": true }))
+                .with_header("Set-Cookie", &expire_cookie("gk_session")),
+            Err(e) => err(500, &e),
+        },
         "/register/revoke" => {
             match engine.revoke(&field("kind"), &field("label")) {
                 Ok(0) => err(404, "no such credential"),
@@ -275,6 +320,22 @@ pub fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rate_limited_paths_are_public_and_the_token_bucket_is_separate() {
+        // If a new public endpoint checks a credential or allocates state, it
+        // belongs in the `limited` match; this test is the reminder.
+        for p in ["/login/token", "/login/verify", "/login/challenge", "/login/device/start"] {
+            assert!(lookup(p).expect(p).public, "{p} should be public");
+        }
+        // The bootstrap token must not share a budget with the passkey path,
+        // or exhausting one locks you out of the other.
+        let src = include_str!("login.rs");
+        assert!(
+            src.contains(r#""/login/token" => Some(("token", &CREDENTIAL))"#),
+            "the bootstrap token needs its own rate-limit bucket"
+        );
+    }
 
     #[test]
     fn registration_paths_are_all_private() {

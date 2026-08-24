@@ -106,7 +106,7 @@ pub struct PasskeyEngine {
     webauthn: Webauthn,
     cfg: PasskeyConfig,
     path: PathBuf,
-    session_key: [u8; 32],
+    session_key: Mutex<[u8; 32]>,
     user_id: Uuid,
     state: Mutex<StoreFile>,
     reg_states: Mutex<HashMap<String, (Instant, PasskeyRegistration)>>,
@@ -176,7 +176,7 @@ impl PasskeyEngine {
             webauthn,
             cfg: cfg.clone(),
             path,
-            session_key,
+            session_key: Mutex::new(session_key),
             user_id,
             state: Mutex::new(store),
             reg_states: Mutex::new(HashMap::new()),
@@ -284,6 +284,9 @@ impl PasskeyEngine {
         {
             let mut states = self.reg_states.lock().unwrap();
             prune(&mut states, CEREMONY_TTL);
+            if states.len() >= MAX_CEREMONIES {
+                return Err("too many registrations in flight; try again shortly".into());
+            }
             states.insert(id.clone(), (Instant::now(), reg_state));
         }
         Ok(serde_json::json!({
@@ -362,6 +365,9 @@ impl PasskeyEngine {
         {
             let mut states = self.auth_states.lock().unwrap();
             prune(&mut states, CEREMONY_TTL);
+            if states.len() >= MAX_CEREMONIES {
+                return Err("too many logins in flight; try again shortly".into());
+            }
             states.insert(id.clone(), (Instant::now(), auth_state));
         }
         Ok(serde_json::json!({ "ceremony": id, "options": challenge }))
@@ -428,10 +434,41 @@ impl PasskeyEngine {
     }
 
     fn sign(&self, data: &[u8]) -> String {
-        let mut mac = HmacSha256::new_from_slice(&self.session_key)
+        let key = *self.session_key.lock().unwrap();
+        let mut mac = HmacSha256::new_from_slice(&key)
             .expect("HMAC accepts any key length");
         mac.update(data);
         B64.encode(mac.finalize().into_bytes())
+    }
+
+    /// Rotate the session-signing key, invalidating **every** outstanding
+    /// session cookie on every device at once, including the caller's own.
+    ///
+    /// Sessions are stateless signed tokens, which is why there is no session
+    /// table to grow or leak — but it also means an individual session cannot
+    /// be revoked. Changing the key that signs them is the kill switch, and
+    /// before this existed the only way to reach it was editing the store by
+    /// hand and restarting.
+    pub fn rotate_session_key(&self) -> Result<(), String> {
+        let mut key = [0u8; 32];
+        getrandom(&mut key)?;
+        let encoded = B64.encode(key);
+        let previous = {
+            let mut store = self.state.lock().unwrap();
+            let prev = store.session_key.clone();
+            store.session_key = Some(encoded);
+            prev
+        };
+        if let Err(e) = self.persist() {
+            // Roll back, so the key in memory and the key on disk can never
+            // disagree — that would log everyone out now and then silently log
+            // them back in on the next restart.
+            let mut store = self.state.lock().unwrap();
+            store.session_key = previous;
+            return Err(e);
+        }
+        *self.session_key.lock().unwrap() = key;
+        Ok(())
     }
 
     /// Verify a session cookie value: signature first (constant-time), then
@@ -479,6 +516,9 @@ impl PasskeyEngine {
         {
             let mut devices = self.devices.lock().unwrap();
             devices.retain(|_, d| d.created.elapsed() < DEVICE_TTL);
+            if devices.len() >= MAX_DEVICE_REQUESTS {
+                return Err("too many device requests in flight; try again shortly".into());
+            }
             devices.insert(
                 device_code.clone(),
                 DeviceRequest {
@@ -608,6 +648,13 @@ impl PasskeyEngine {
         &self.cfg
     }
 }
+
+/// Ceilings on in-flight state. Per-IP rate limiting handles one noisy client;
+/// these handle the case it cannot see, which is many clients each staying
+/// under the limit. Reaching one of these means refusing new ceremonies for a
+/// few minutes, never dropping an established credential.
+const MAX_CEREMONIES: usize = 512;
+const MAX_DEVICE_REQUESTS: usize = 512;
 
 /// Drop ceremony entries older than `ttl`, so a flood of abandoned ceremonies
 /// cannot grow the map without bound.

@@ -51,6 +51,10 @@ li .when { color:var(--muted); font-size:.82rem; }
 
   <h2>Device tokens</h2>
   <ul id="devices"></ul>
+
+  <h2>Sessions</h2>
+  <p class="sub" style="margin:0 0 12px">Browser sessions are signed tokens rather than stored ones, so there is no list of them to show. Rotating the signing key is the kill switch: it ends every session on every device at once, including this one.</p>
+  <button class="danger" id="revokeall">Sign out everywhere</button>
 </div>
 <script src="/login/webauthn.js"></script>
 <script>
@@ -120,6 +124,19 @@ document.getElementById("add").addEventListener("click", async () => {
     show("ok", "Passkey added.");
     document.getElementById("label").value = "";
     refresh();
+  } catch (e) {
+    show("err", e.message || String(e));
+  }
+});
+
+document.getElementById("revokeall").addEventListener("click", async () => {
+  clear();
+  if (!confirm("Sign out of every device, including this one?")) return;
+  try {
+    await postJSON("/register/revoke-sessions", {});
+    // Our own session is gone too, so there is nothing useful left on this
+    // page. Go to the sign-in page rather than leaving a dead one on screen.
+    location.href = "/login";
   } catch (e) {
     show("err", e.message || String(e));
   }
