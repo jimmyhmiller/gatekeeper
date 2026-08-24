@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""gkfiles — turn a plain folder into a browsable, privately-served file drop.
+
+gatekeeper already serves static directories, and its routes are private unless
+they say `public = true`. So a private file drop needs no gatekeeper changes at
+all: point a `static` route at a folder and leave `public` off.
+
+The one thing it deliberately does not do is autoindex — `serve.rs` maps a
+directory to `index.html` and 404s if there isn't one. That is a reasonable
+default for a website and useless for a drop folder, where the whole point is
+seeing what is in it. This writes those index.html files.
+
+  gkfiles index            regenerate the indexes once
+  gkfiles watch            keep regenerating as the folder changes
+  gkfiles status           show what is in the drop folder
+
+The folder is the source of truth; this only ever writes index.html files into
+it and never touches anything else you put there.
+"""
+
+import argparse
+import html
+import os
+import sys
+import time
+import urllib.parse
+from datetime import datetime, timezone
+
+INDEX = "index.html"
+DEFAULT_ROOT = "/srv/files"
+DEFAULT_MOUNT = "/files"
+
+CSS = """
+:root { color-scheme: light dark; --fg:#111; --bg:#fafafa; --card:#fff; --line:#e2e2e2;
+  --muted:#666; --accent:#0b5fff; }
+@media (prefers-color-scheme: dark) { :root { --fg:#e8e8e8; --bg:#131313; --card:#1b1b1b;
+  --line:#2e2e2e; --muted:#9a9a9a; --accent:#5b9bff; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); padding:36px 20px 80px;
+  font:15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width:52rem; margin:0 auto; }
+h1 { margin:0 0 4px; font-size:1.2rem; letter-spacing:-.01em;
+  font-family:ui-monospace, SFMono-Regular, Menlo, monospace; word-break:break-all; }
+.sub { color:var(--muted); margin:0 0 24px; font-size:.88rem; }
+.sub a { color:var(--muted); }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+.row { display:flex; align-items:baseline; gap:14px; padding:11px 18px; border-bottom:1px solid var(--line); }
+.row:last-child { border-bottom:0; }
+.row:hover { background:rgba(127,127,127,.06); }
+.name { flex:1; min-width:0; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size:.9rem; word-break:break-all; }
+.name a { color:var(--accent); text-decoration:none; }
+.name a:hover { text-decoration:underline; }
+.dir a { font-weight:600; }
+.size, .when { flex:0 0 auto; color:var(--muted); font-size:.8rem;
+  font-variant-numeric:tabular-nums; }
+.size { width:5.5rem; text-align:right; }
+.when { width:11rem; text-align:right; }
+.empty { padding:22px 18px; color:var(--muted); font-size:.9rem; }
+footer { margin-top:22px; color:var(--muted); font-size:.78rem; }
+@media (max-width:34rem) { .when { display:none; } }
+"""
+
+
+def human_size(n):
+    if n < 1024:
+        return f"{n} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024.0
+        if n < 1024:
+            return f"{n:.1f} {unit}".replace(".0 ", " ")
+    return f"{n:.1f} PB"
+
+
+def human_time(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def dir_size(path):
+    """Recursive byte total, for showing a folder's weight in the listing."""
+    total = 0
+    for dirpath, _dirnames, filenames in os.walk(path):
+        for f in filenames:
+            if f == INDEX:
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    return total
+
+
+def render(root, cur, mount):
+    """Build the index.html body for one directory."""
+    rel = os.path.relpath(cur, root)
+    rel = "" if rel == "." else rel
+    url_prefix = mount.rstrip("/") + ("/" + urllib.parse.quote(rel) if rel else "")
+    crumb = "/" + rel if rel else "/"
+
+    entries = []
+    try:
+        names = sorted(os.listdir(cur), key=lambda s: s.lower())
+    except OSError as e:
+        names = []
+        print(f"gkfiles: cannot list {cur}: {e}", file=sys.stderr)
+
+    for name in names:
+        if name == INDEX:
+            continue  # never list the file we generate
+        full = os.path.join(cur, name)
+        try:
+            st = os.stat(full)
+        except OSError:
+            continue  # vanished mid-walk; skip rather than crash
+        is_dir = os.path.isdir(full)
+        entries.append({
+            "name": name,
+            "dir": is_dir,
+            "size": dir_size(full) if is_dir else st.st_size,
+            "mtime": st.st_mtime,
+        })
+    # Directories first, then files, each alphabetical.
+    entries.sort(key=lambda e: (not e["dir"], e["name"].lower()))
+
+    rows = []
+    if rel:
+        parent = os.path.dirname(rel)
+        up = mount.rstrip("/") + ("/" + urllib.parse.quote(parent) if parent else "") + "/"
+        rows.append(
+            f'<div class="row dir"><div class="name"><a href="{html.escape(up)}">../</a></div>'
+            f'<div class="size"></div><div class="when"></div></div>'
+        )
+    for e in entries:
+        href = url_prefix.rstrip("/") + "/" + urllib.parse.quote(e["name"]) + ("/" if e["dir"] else "")
+        label = html.escape(e["name"]) + ("/" if e["dir"] else "")
+        cls = "row dir" if e["dir"] else "row"
+        rows.append(
+            f'<div class="{cls}"><div class="name"><a href="{html.escape(href)}">{label}</a></div>'
+            f'<div class="size">{human_size(e["size"])}</div>'
+            f'<div class="when">{human_time(e["mtime"])}</div></div>'
+        )
+
+    if rows and not (len(rows) == 1 and rel):
+        body = "".join(rows)
+    elif rel:
+        body = "".join(rows) + '<div class="empty">This folder is empty.</div>'
+    else:
+        body = '<div class="empty">Nothing here yet. Drop files into the folder and they will show up.</div>'
+
+    n_files = sum(1 for e in entries if not e["dir"])
+    n_dirs = sum(1 for e in entries if e["dir"])
+    total = sum(e["size"] for e in entries if not e["dir"])
+    summary = f"{n_files} file{'' if n_files == 1 else 's'}"
+    if n_dirs:
+        summary += f", {n_dirs} folder{'' if n_dirs == 1 else 's'}"
+    if n_files:
+        summary += f", {human_size(total)}"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(crumb)}</title>
+<style>{CSS}</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>{html.escape(crumb)}</h1>
+  <p class="sub">{summary} &middot; <a href="/">gatekeeper</a></p>
+  <div class="card">{body}</div>
+  <footer>Generated by gkfiles at {human_time(time.time())} UTC. This listing is private: you are seeing it because you are signed in.</footer>
+</div>
+</body>
+</html>
+"""
+
+
+def build(root, mount, quiet=False):
+    """Write an index.html into root and every directory beneath it."""
+    if not os.path.isdir(root):
+        print(f"gkfiles: {root} does not exist or is not a directory", file=sys.stderr)
+        return 1
+    written = 0
+    for dirpath, dirnames, _files in os.walk(root):
+        dirnames.sort()
+        page = render(root, dirpath, mount)
+        target = os.path.join(dirpath, INDEX)
+        # Only rewrite when the content actually changed, so watch mode does
+        # not churn mtimes (which would look like new activity to anything
+        # else watching this tree, including the next poll).
+        try:
+            with open(target) as fh:
+                if fh.read() == page:
+                    continue
+        except OSError:
+            pass
+        try:
+            tmp = target + ".tmp"
+            with open(tmp, "w") as fh:
+                fh.write(page)
+            os.replace(tmp, target)
+            os.chmod(target, 0o644)
+            written += 1
+        except OSError as e:
+            print(f"gkfiles: cannot write {target}: {e}", file=sys.stderr)
+            return 1
+    if not quiet:
+        print(f"gkfiles: {'updated' if written else 'already current:'} {written or ''} index page(s) under {root}".replace("  ", " "))
+    return 0
+
+
+def snapshot(root):
+    """A cheap fingerprint of the tree, ignoring the files we generate."""
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for f in sorted(filenames):
+            if f == INDEX or f == INDEX + ".tmp":
+                continue
+            p = os.path.join(dirpath, f)
+            try:
+                st = os.stat(p)
+                out.append((p, st.st_mtime, st.st_size))
+            except OSError:
+                pass
+        out.append((dirpath, None, None))
+    return tuple(out)
+
+
+def watch(root, mount, interval):
+    print(f"gkfiles: watching {root} (every {interval}s), serving at {mount}", flush=True)
+    build(root, mount, quiet=True)
+    last = snapshot(root)
+    while True:
+        time.sleep(interval)
+        try:
+            now = snapshot(root)
+        except OSError as e:
+            print(f"gkfiles: cannot scan {root}: {e}", file=sys.stderr, flush=True)
+            continue
+        if now != last:
+            last = now
+            build(root, mount, quiet=True)
+            print(f"gkfiles: reindexed at {human_time(time.time())} UTC", flush=True)
+
+
+def status(root, mount):
+    if not os.path.isdir(root):
+        print(f"gkfiles: {root} does not exist")
+        return 1
+    files = dirs = 0
+    total = 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirs += len(dirnames)
+        for f in filenames:
+            if f == INDEX:
+                continue
+            files += 1
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:
+                pass
+    print(f"  folder:  {root}")
+    print(f"  served:  {mount}  (private — sign in or send a bearer token)")
+    print(f"  holds:   {files} file(s), {dirs} folder(s), {human_size(total)}")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="gkfiles",
+        description="Turn a folder into a browsable, privately-served file drop for gatekeeper.",
+    )
+    ap.add_argument("command", choices=["index", "watch", "status"])
+    ap.add_argument("--root", default=os.environ.get("GKFILES_ROOT", DEFAULT_ROOT),
+                    help=f"the drop folder (default {DEFAULT_ROOT})")
+    ap.add_argument("--mount", default=os.environ.get("GKFILES_MOUNT", DEFAULT_MOUNT),
+                    help=f"the gatekeeper route path it is served at (default {DEFAULT_MOUNT})")
+    ap.add_argument("--interval", type=float, default=2.0, help="watch poll interval in seconds")
+    args = ap.parse_args()
+
+    if args.command == "index":
+        return build(args.root, args.mount)
+    if args.command == "watch":
+        return watch(args.root, args.mount, args.interval)
+    return status(args.root, args.mount)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)

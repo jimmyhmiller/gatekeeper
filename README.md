@@ -68,6 +68,45 @@ Per route:
 The **token is never in the config file** — it comes from `$GATEKEEPER_TOKEN` or
 `--token-file <path>`. Boot fails if any private route exists and no token is set.
 
+## A private file drop
+
+You do not need anything new for this: `static` is already a route target and
+routes are already private by default. A folder that only you can read is one
+config block.
+
+```toml
+[[route]]
+path = "/files"
+static = "/srv/files"
+# 'public' omitted -> PRIVATE, like everything else
+```
+
+The one gap is that static serving deliberately has **no autoindex** — a
+directory maps to `index.html` and 404s without one. Sensible for a website,
+useless for a drop folder, where seeing what is in it is the entire point.
+
+`bin/gkfiles` fills that gap from outside the gate, so the gate stays unchanged.
+It writes the `index.html` pages that make the folder browsable, and nothing
+else:
+
+```sh
+gkfiles index     # regenerate the listings once
+gkfiles watch     # keep regenerating as the folder changes
+gkfiles status    # what is in the drop folder
+```
+
+Run `watch` from a systemd unit and dropping a file with `scp` is the whole
+workflow. It only ever writes `index.html`; your files are the source of truth,
+and it rewrites a page only when the content actually changed, so it does not
+churn mtimes.
+
+Two things to know. The folder must be readable by the user the gate runs as,
+which for a home directory usually means it is not — put it somewhere like
+`/srv` and give the group read access. And the MIME table in `serve.rs` is
+short, so anything it does not recognise is served `application/octet-stream`
+and downloads rather than rendering, which is usually what you want from a
+drop folder anyway.
+
 ## The dashboard
 
 Point a route at `dashboard = true` and it serves a human-readable index of
