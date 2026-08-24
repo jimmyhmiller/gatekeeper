@@ -9,5 +9,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 gatekeeper-fn = { path = "../../crates/gatekeeper-fn" }
-datalog-client = { path = "../../../axiom-reload/crates/datalog-client" }
+datalog-client = { path = "../../crates/datalog-client" }
 serde_json = "1"

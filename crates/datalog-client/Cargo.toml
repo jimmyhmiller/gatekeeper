@@ -1,0 +1,8 @@
+[package]
+name = "datalog-client"
+version = "0.1.0"
+edition = "2021"
+description = "A tiny pure-Rust client for the datalog-db wire protocol (query + transact). Vendored from the PlayGround monorepo; see src/lib.rs."
+
+[dependencies]
+serde_json = "1"
