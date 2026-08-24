@@ -12,7 +12,10 @@ body { margin:0; min-height:100vh; background:var(--bg); color:var(--fg); paddin
   font:15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
 .card { width:100%; max-width:34rem; margin:0 auto; background:var(--card); border:1px solid var(--line);
   border-radius:12px; padding:28px; }
-h1 { margin:0 0 4px; font-size:1.15rem; }
+h1 { margin:0; font-size:1.15rem; }
+.head { display:flex; align-items:baseline; justify-content:space-between; gap:12px; margin-bottom:4px; }
+.signout { color:var(--muted); font-size:.85rem; text-decoration:none; }
+.signout:hover { color:var(--accent); text-decoration:underline; }
 h2 { margin:26px 0 10px; font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); }
 p.sub { margin:0 0 20px; color:var(--muted); font-size:.9rem; }
 button { padding:11px 14px; font:inherit; font-weight:600; border:0; border-radius:8px;
@@ -33,7 +36,10 @@ li .when { color:var(--muted); font-size:.82rem; }
 </head>
 <body>
 <div class="card">
-  <h1>Passkeys</h1>
+  <div class="head">
+    <h1>Passkeys</h1>
+    <a class="signout" href="/logout">Sign out</a>
+  </div>
   <p class="sub">Credentials that can sign in to this gate. This page is private: you are seeing it because you already authenticated.</p>
 
   <input id="label" placeholder="Name this passkey (e.g. MacBook Touch ID)" autocomplete="off">

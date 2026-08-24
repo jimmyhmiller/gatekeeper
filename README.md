@@ -265,6 +265,13 @@ has no path to enrolling a credential. Bootstrapping goes:
 The token keeps working on every private route as break-glass, so a lost passkey
 never locks you out.
 
+**Signing out** is `/logout` (linked from `/register`). It expires both the
+passkey session and the break-glass `gatekeeper=<token>` cookie and redirects to
+`/login`. There is no session table to delete, because sessions are signed
+rather than stored, so this is purely cookie expiry. It is public on purpose: if
+signing out required being signed in, a stale or half-broken cookie would be
+impossible to clear.
+
 ### The command line
 
 A CLI cannot run a WebAuthn ceremony — passkeys need a browser or platform

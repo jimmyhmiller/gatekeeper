@@ -35,6 +35,7 @@ pub const RESERVED: &[Reserved] = &[
     Reserved { path: "/login/challenge", public: true, desc: "begin a passkey assertion" },
     Reserved { path: "/login/verify", public: true, desc: "finish a passkey assertion" },
     Reserved { path: "/login/token", public: true, desc: "break-glass: bootstrap token for a session" },
+    Reserved { path: "/logout", public: true, desc: "clear the session cookie" },
     Reserved { path: "/login/device/start", public: true, desc: "CLI device flow: request a code" },
     Reserved { path: "/login/device/poll", public: true, desc: "CLI device flow: poll for approval" },
     Reserved { path: "/login/device/approve", public: false, desc: "CLI device flow: approve a code" },
@@ -81,6 +82,13 @@ fn err(status: u16, message: &str) -> Reply {
     json(status, serde_json::json!({ "error": message }))
 }
 
+/// Expire a cookie: same name, empty value, `Max-Age=0`. The attributes have to
+/// match the ones it was set with or the browser treats it as a different
+/// cookie and quietly keeps the original.
+fn expire_cookie(name: &str) -> String {
+    format!("{name}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax")
+}
+
 fn html(body: &'static str) -> Reply {
     Reply::new(200, body.as_bytes().to_vec())
         .with_header("Content-Type", "text/html; charset=utf-8")
@@ -110,7 +118,7 @@ pub fn handle(
     // method up front keeps a stray GET from being treated as an empty body.
     let want_post = !matches!(
         path,
-        "/login" | "/login/webauthn.js" | "/register" | APPLE_AASA
+        "/login" | "/login/webauthn.js" | "/register" | "/logout" | APPLE_AASA
     );
     if want_post && method != "POST" {
         return err(405, "method not allowed");
@@ -134,6 +142,16 @@ pub fn handle(
 
     match path {
         "/login" => html(include_str!("web/login.html")),
+        // Signing out is just expiring the cookies; there is no server-side
+        // session table to delete, because sessions are signed rather than
+        // stored. Both cookies are cleared: the passkey session and the
+        // documented break-glass `gatekeeper=<token>` one, so a single visit
+        // definitely leaves you unauthenticated rather than leaving whichever
+        // one you did not think about still valid.
+        "/logout" => Reply::status(303, "")
+            .with_header("Location", "/login")
+            .with_header("Set-Cookie", &expire_cookie("gk_session"))
+            .with_header("Set-Cookie", &expire_cookie("gatekeeper")),
         "/register" => html(include_str!("web/register.html")),
         "/login/webauthn.js" => Reply::new(200, include_str!("web/webauthn.js").as_bytes().to_vec())
             .with_header("Content-Type", "application/javascript; charset=utf-8")
@@ -284,6 +302,7 @@ mod tests {
                 "/login/challenge",
                 "/login/verify",
                 "/login/token",
+                "/logout",
                 "/login/device/start",
                 "/login/device/poll",
                 APPLE_AASA,
@@ -291,6 +310,22 @@ mod tests {
             "the set of public built-ins changed; that is the whole exposure \
              surface of this feature, so it should be a deliberate edit"
         );
+    }
+
+    #[test]
+    fn logout_expires_both_cookies() {
+        let s = expire_cookie("gk_session");
+        assert!(s.starts_with("gk_session=;"), "value must be emptied: {s}");
+        assert!(s.contains("Max-Age=0"), "must expire immediately: {s}");
+        // Attributes must match how the cookie was set, or the browser keeps
+        // the original and the logout silently does nothing.
+        assert!(s.contains("Path=/") && s.contains("HttpOnly") && s.contains("Secure"));
+        assert!(s.contains("SameSite=Lax"));
+    }
+
+    #[test]
+    fn logout_is_public_so_a_stale_cookie_can_always_be_cleared() {
+        assert!(lookup("/logout").expect("present").public);
     }
 
     #[test]
