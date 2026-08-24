@@ -486,6 +486,13 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                 // A static shell. Everything it displays comes from /describe,
                 // which is private, so this is safe to serve to anyone: signed
                 // out, the page shows a sign-in prompt and nothing else.
+                //
+                // Only at its own path: see `login::dashboard_serves`. Mounted
+                // at "/" it would otherwise answer for every unmatched request
+                // and quietly turn `unmatched_status` into a 200.
+                Target::Dashboard if !login::dashboard_serves(&rest) => {
+                    Reply::status(routing.unmatched_status, "Not Found")
+                }
                 Target::Dashboard => Reply::new(
                     200,
                     include_str!("web/dashboard.html").as_bytes().to_vec(),

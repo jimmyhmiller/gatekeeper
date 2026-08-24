@@ -77,6 +77,21 @@ pub fn active(passkeys: Option<&PasskeyEngine>) -> Vec<&'static Reserved> {
         .collect()
 }
 
+/// Whether a dashboard route should answer for this remainder.
+///
+/// A route path is a *prefix*, and the dashboard is nearly always mounted at
+/// `/`, which matches every request. A `static` route in that position 404s on
+/// a path with no file behind it; the dashboard has no such natural bottom, so
+/// without this it answers 200 with the index page for literally every
+/// unmatched path — silently defeating `unmatched_status`, whose entire job is
+/// to not confirm that a path exists.
+///
+/// So it answers at its own path and nowhere else. `""` and `"/"` are the same
+/// request (`/dash` and `/dash/`); anything deeper is a miss.
+pub fn dashboard_serves(rest: &str) -> bool {
+    rest.is_empty() || rest == "/"
+}
+
 fn json(status: u16, value: serde_json::Value) -> Reply {
     Reply::new(status, value.to_string().into_bytes())
         .with_header("Content-Type", "application/json")
@@ -371,6 +386,18 @@ mod tests {
             "the set of public built-ins changed; that is the whole exposure \
              surface of this feature, so it should be a deliberate edit"
         );
+    }
+
+    #[test]
+    fn dashboard_answers_only_at_its_own_path() {
+        assert!(dashboard_serves(""), "the route path itself");
+        assert!(dashboard_serves("/"), "trailing slash is the same request");
+        // Everything below must fall through to unmatched_status. Mounted at
+        // "/", these are the whole internet.
+        for rest in ["/nope", "/analytics-other", "/.well-known/apple-app-site-association",
+                     "/a/b", "/favicon.ico", "//"] {
+            assert!(!dashboard_serves(rest), "{rest} must NOT serve the dashboard");
+        }
     }
 
     #[test]
