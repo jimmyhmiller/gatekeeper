@@ -74,6 +74,10 @@ struct Routing {
     /// `Router::decide`, which still just asks "was auth ok?".
     verifier: Verifier,
     unmatched_status: u16,
+    tls: bool,
+    /// The scheduled jobs, snapshotted for `/describe`. The scheduler owns the
+    /// running threads; this is just what to report.
+    jobs: Vec<config::Job>,
 }
 
 /// Everything a worker needs to handle a request, shared across threads. The
@@ -226,6 +230,8 @@ fn build_routing(
         router: Router::new(cfg.route.clone()),
         verifier: Verifier::new(token.map(Authenticator::new), passkeys),
         unmatched_status: cfg.unmatched_status,
+        tls: cfg.tls_enabled(),
+        jobs: cfg.job.clone(),
     }
 }
 
@@ -459,6 +465,21 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                 }
             }
             match route.target() {
+                // A static shell. Everything it displays comes from /describe,
+                // which is private, so this is safe to serve to anyone: signed
+                // out, the page shows a sign-in prompt and nothing else.
+                Target::Dashboard => Reply::new(
+                    200,
+                    include_str!("web/dashboard.html").as_bytes().to_vec(),
+                )
+                .with_header("Content-Type", "text/html; charset=utf-8")
+                .with_header(
+                    "Content-Security-Policy",
+                    "default-src 'none'; script-src 'self' 'unsafe-inline'; \
+                     style-src 'unsafe-inline'; connect-src 'self'; form-action 'none'",
+                )
+                .with_header("Referrer-Policy", "no-referrer")
+                .with_header("X-Content-Type-Options", "nosniff"),
                 Target::Static(dir) => serve::serve(&dir, &rest),
                 Target::Proxy(upstream) => {
                     // Read the request body to forward it (bounded by tiny_http).
@@ -590,6 +611,7 @@ fn target_desc(r: &config::Route) -> String {
         (Some(d), _, _) => format!("static {}", d.display()),
         (_, Some(u), _) => format!("proxy {u}"),
         (_, _, Some(l)) => format!("function {}", l.display()),
+        _ if r.dashboard => "dashboard (built-in index)".into(),
         _ => "(invalid)".into(),
     }
 }
@@ -634,16 +656,74 @@ fn describe_catalog(gate: &Gate, routing: &Routing) -> Reply {
             entry["kind"] = json!("static");
         } else if r.proxy.is_some() {
             entry["kind"] = json!("proxy");
+        } else if r.dashboard {
+            entry["kind"] = json!("dashboard");
         }
         routes.push(entry);
     }
+
+    // The reserved built-ins, with the same access vocabulary as configured
+    // routes, so a reader sees ONE list of everything the gate answers on
+    // rather than having to know that some paths come from a table in the
+    // binary. Safe to include: /describe is private.
+    let builtin: Vec<Value> = login::active(gate.passkeys.as_deref())
+        .iter()
+        .map(|r| {
+            json!({
+                "path": r.path,
+                "access": if r.public { "public" } else { "private" },
+                "summary": r.desc,
+            })
+        })
+        .collect();
+
+    let jobs: Vec<Value> = routing
+        .jobs
+        .iter()
+        .map(|j| {
+            json!({
+                "name": j.name,
+                "command": j.command.join(" "),
+                "every": j.every,
+                "run_at_start": j.run_at_start,
+            })
+        })
+        .collect();
+
+    // Credential inventory. Labels and enrollment times only: no public keys,
+    // no token values, no hashes.
+    let passkeys = match gate.passkeys.as_deref() {
+        None => json!({ "enabled": false }),
+        Some(p) => {
+            let pairs = |v: Vec<(String, u64)>| -> Vec<Value> {
+                v.into_iter()
+                    .map(|(label, added)| json!({ "label": label, "added": added }))
+                    .collect()
+            };
+            let c = p.config();
+            json!({
+                "enabled": true,
+                "rp_id": c.rp_id,
+                "origin": c.origin,
+                "session_ttl_secs": c.session_ttl_secs,
+                "apple_app_ids": c.apple_app_ids,
+                "enrolled": pairs(p.credential_summary()),
+                "devices": pairs(p.device_summary()),
+            })
+        }
+    };
 
     let catalog = json!({
         "gatekeeper": {
             "describe_path": DESCRIBE_PATH,
             "abi_version": gatekeeper_abi::GK_ABI_VERSION,
+            "tls": routing.tls,
+            "unmatched_status": routing.unmatched_status,
         },
         "routes": routes,
+        "builtin": builtin,
+        "jobs": jobs,
+        "passkeys": passkeys,
     });
 
     let body = serde_json::to_vec_pretty(&catalog).unwrap_or_else(|_| b"{}".to_vec());

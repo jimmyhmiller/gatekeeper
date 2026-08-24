@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gatekeeper</title>
+<style>
+:root { color-scheme: light dark; --fg:#111; --bg:#fafafa; --card:#fff; --line:#e2e2e2; --muted:#666;
+  --accent:#0b5fff; --pub:#b26a00; --pubbg:rgba(230,150,0,.14); --priv:#1b8a4b; --privbg:rgba(20,150,70,.12);
+  --codebg:#f2f2f4; }
+@media (prefers-color-scheme: dark) { :root { --fg:#e8e8e8; --bg:#131313; --card:#1b1b1b; --line:#2e2e2e;
+  --muted:#9a9a9a; --accent:#5b9bff; --pub:#ffb84d; --pubbg:rgba(255,170,40,.14); --priv:#4fc98a;
+  --privbg:rgba(40,200,120,.13); --codebg:#242426; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg); padding:36px 20px 80px;
+  font:15px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+.wrap { max-width:56rem; margin:0 auto; }
+header { display:flex; align-items:baseline; justify-content:space-between; gap:16px; flex-wrap:wrap; margin-bottom:6px; }
+h1 { margin:0; font-size:1.35rem; letter-spacing:-.01em; }
+h1 span { color:var(--muted); font-weight:400; font-size:.85rem; margin-left:8px; letter-spacing:0; }
+.tagline { color:var(--muted); margin:0 0 26px; font-size:.92rem; }
+h2 { font-size:.78rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted);
+  margin:34px 0 12px; font-weight:600; }
+h2 .count { text-transform:none; letter-spacing:0; font-weight:400; opacity:.75; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:0; overflow:hidden; }
+.card.pad { padding:22px; }
+.row { display:flex; align-items:flex-start; gap:14px; padding:13px 18px; border-bottom:1px solid var(--line); }
+.row:last-child { border-bottom:0; }
+.row .main { flex:1; min-width:0; }
+.path { font:600 .93rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; word-break:break-all; }
+.meta { color:var(--muted); font-size:.83rem; margin-top:3px; }
+.badge { flex:0 0 auto; font-size:.68rem; font-weight:700; letter-spacing:.05em; text-transform:uppercase;
+  padding:3px 8px; border-radius:5px; margin-top:2px; }
+.badge.public { color:var(--pub); background:var(--pubbg); }
+.badge.private { color:var(--priv); background:var(--privbg); }
+details.ep { border-top:1px dashed var(--line); }
+details.ep summary { cursor:pointer; padding:9px 18px 9px 34px; font-size:.86rem; color:var(--muted); }
+details.ep summary:hover { color:var(--accent); }
+.ep-item { padding:10px 18px 14px 34px; border-top:1px solid var(--line); }
+.ep-head { font:600 .88rem/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.ep-sum { color:var(--muted); font-size:.85rem; margin:2px 0 7px; }
+.params { margin:6px 0 0; padding:0; list-style:none; font-size:.83rem; }
+.params li { padding:2px 0; color:var(--muted); }
+.params code { color:var(--fg); }
+code, .code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+pre.cmd { background:var(--codebg); border-radius:7px; padding:9px 11px; margin:8px 0 0; overflow-x:auto;
+  font-size:.8rem; position:relative; }
+pre.cmd button { position:absolute; top:6px; right:6px; font:inherit; font-size:.7rem; padding:2px 7px;
+  border:1px solid var(--line); border-radius:5px; background:var(--card); color:var(--muted); cursor:pointer; }
+pre.cmd button:hover { color:var(--accent); }
+button.primary { padding:11px 18px; font:inherit; font-weight:600; border:0; border-radius:8px;
+  background:var(--accent); color:#fff; cursor:pointer; }
+a { color:var(--accent); }
+a.quiet { color:var(--muted); font-size:.85rem; text-decoration:none; }
+a.quiet:hover { color:var(--accent); text-decoration:underline; }
+.empty { color:var(--muted); font-size:.88rem; padding:14px 18px; }
+.kv { display:grid; grid-template-columns:auto 1fr; gap:5px 18px; font-size:.88rem; }
+.kv dt { color:var(--muted); }
+.kv dd { margin:0; }
+.msg { padding:12px 14px; border-radius:8px; font-size:.88rem; background:rgba(200,40,40,.12); color:#c62828; }
+#signedout { text-align:center; padding:40px 24px; }
+#signedout p { color:var(--muted); max-width:32rem; margin:0 auto 22px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>gatekeeper<span id="host"></span></h1>
+    <div id="authlinks"></div>
+  </header>
+  <p class="tagline">A fail-closed HTTP front gate. Every route is private unless it explicitly says otherwise.</p>
+  <div id="content"></div>
+</div>
+<script>
+const $ = (t, cls, text) => {
+  const el = document.createElement(t);
+  if (cls) el.className = cls;
+  // textContent, never innerHTML: every string below is server data, and some
+  // of it (credential labels, job commands) is typed by a human.
+  if (text !== undefined && text !== null) el.textContent = String(text);
+  return el;
+};
+const content = document.getElementById("content");
+document.getElementById("host").textContent = location.host;
+
+function section(title, count) {
+  const h = $("h2", null, title);
+  if (count !== undefined) { const c = $("span", "count", "  " + count); h.appendChild(c); }
+  content.appendChild(h);
+  const card = $("div", "card");
+  content.appendChild(card);
+  return card;
+}
+
+function badge(access) { return $("span", "badge " + access, access); }
+
+function copyable(text) {
+  const pre = $("pre", "cmd");
+  pre.appendChild($("code", null, text));
+  const btn = $("button", null, "copy");
+  btn.onclick = () => {
+    navigator.clipboard.writeText(text).then(
+      () => { btn.textContent = "copied"; setTimeout(() => (btn.textContent = "copy"), 1200); },
+      () => { btn.textContent = "failed"; }
+    );
+  };
+  pre.appendChild(btn);
+  return pre;
+}
+
+function row(path, meta, access) {
+  const r = $("div", "row");
+  const main = $("div", "main");
+  main.appendChild($("div", "path", path));
+  if (meta) main.appendChild($("div", "meta", meta));
+  r.appendChild(main);
+  if (access) r.appendChild(badge(access));
+  return r;
+}
+
+function renderEndpoints(card, route) {
+  const d = route.description;
+  if (!d || !Array.isArray(d.endpoints) || !d.endpoints.length) return;
+  const det = $("details", "ep");
+  const sum = $("summary", null, d.endpoints.length + " endpoint" + (d.endpoints.length === 1 ? "" : "s") +
+    (d.name ? " in " + d.name : ""));
+  det.appendChild(sum);
+  for (const ep of d.endpoints) {
+    const item = $("div", "ep-item");
+    const methods = Array.isArray(ep.methods) ? ep.methods.join("/") : "GET";
+    item.appendChild($("div", "ep-head", methods + "  " + route.path + ep.path));
+    if (ep.summary) item.appendChild($("div", "ep-sum", ep.summary));
+    if (Array.isArray(ep.params) && ep.params.length) {
+      const ul = $("ul", "params");
+      for (const p of ep.params) {
+        const li = $("li");
+        li.appendChild($("code", null, p.name));
+        let tail = "  " + (p.type || "") + (p.required ? " (required)" : "") +
+          (p.default ? " default " + p.default : "");
+        if (p.description) tail += " — " + p.description;
+        li.appendChild(document.createTextNode(tail));
+        ul.appendChild(li);
+      }
+      item.appendChild(ul);
+    }
+    if (ep.returns) item.appendChild($("div", "ep-sum", "returns " + ep.returns));
+    const target = route.path + (ep.example || ep.path);
+    const auth = route.access === "private" ? '-H "Authorization: Bearer $TOKEN" ' : "";
+    item.appendChild(copyable("curl " + auth + "https://" + location.host + target));
+    det.appendChild(item);
+  }
+  card.appendChild(det);
+}
+
+function renderSignedOut() {
+  const links = document.getElementById("authlinks");
+  links.appendChild(Object.assign($("a", "quiet", "Sign in"), { href: "/login" }));
+  const card = $("div", "card pad");
+  card.id = "signedout";
+  const inner = $("div");
+  inner.appendChild($("p", null,
+    "Sign in to see everything this gate exposes: its routes, which of them are public, " +
+    "the API endpoints each function serves, the scheduled jobs, and your enrolled credentials. " +
+    "None of that is shown to anyone who is not signed in."));
+  const btn = $("button", "primary", "Sign in with a passkey");
+  btn.onclick = () => (location.href = "/login");
+  inner.appendChild(btn);
+  card.appendChild(inner);
+  content.appendChild(card);
+}
+
+function renderCatalog(d) {
+  const links = document.getElementById("authlinks");
+  links.appendChild(Object.assign($("a", "quiet", "Passkeys"), { href: "/register" }));
+  links.appendChild(document.createTextNode("   "));
+  links.appendChild(Object.assign($("a", "quiet", "Sign out"), { href: "/logout" }));
+
+  // --- gate summary ---
+  const g = d.gatekeeper || {};
+  const sum = $("div", "card pad");
+  const kv = $("dl", "kv");
+  const add = (k, v) => { kv.appendChild($("dt", null, k)); kv.appendChild($("dd", null, v)); };
+  add("TLS", g.tls ? "on" : "off (plain HTTP)");
+  add("Unmatched paths", g.unmatched_status + " (denied either way)");
+  add("Function ABI", "v" + g.abi_version);
+  if (d.passkeys && d.passkeys.enabled) add("Passkey origin", d.passkeys.origin);
+  sum.appendChild(kv);
+  content.appendChild(sum);
+
+  // --- configured routes ---
+  const routes = d.routes || [];
+  const rc = section("Routes", routes.length);
+  if (!routes.length) rc.appendChild($("div", "empty", "None configured."));
+  for (const r of routes) {
+    rc.appendChild(row(r.path, r.target, r.access));
+    if (r.description_error) rc.appendChild($("div", "empty", "description unavailable: " + r.description_error));
+    renderEndpoints(rc, r);
+  }
+
+  // --- built-ins ---
+  const bi = d.builtin || [];
+  const bc = section("Built-in", bi.length + " reserved, config cannot override");
+  if (!bi.length) bc.appendChild($("div", "empty", "None."));
+  for (const b of bi) bc.appendChild(row(b.path, b.summary, b.access));
+
+  // --- jobs ---
+  const jobs = d.jobs || [];
+  const jc = section("Scheduled jobs", jobs.length);
+  if (!jobs.length) jc.appendChild($("div", "empty", "None."));
+  for (const j of jobs) {
+    jc.appendChild(row(j.name, j.command + "   every " + j.every + (j.run_at_start ? ", and at start" : "")));
+  }
+
+  // --- credentials ---
+  const pk = d.passkeys || { enabled: false };
+  const cc = section("Credentials");
+  if (!pk.enabled) {
+    cc.appendChild($("div", "empty", "Passkeys are off: no [passkey] section in the config."));
+  } else {
+    const when = (s) => new Date(s * 1000).toLocaleString();
+    if (!(pk.enrolled || []).length) {
+      cc.appendChild($("div", "empty", "No passkeys enrolled yet. Enroll one at /register."));
+    }
+    for (const c of pk.enrolled || []) cc.appendChild(row(c.label, "passkey, added " + when(c.added)));
+    for (const c of pk.devices || []) cc.appendChild(row(c.label, "device token, issued " + when(c.added)));
+    if (!(pk.devices || []).length) {
+      cc.appendChild($("div", "empty", "No device tokens issued. Run gatekeeper-login on a machine to get one."));
+    }
+  }
+
+  // --- how to use ---
+  const hc = section("Using it from a terminal");
+  const box = $("div", "empty");
+  box.appendChild(document.createTextNode("Log this machine in with your passkey, then send the device token as a bearer:"));
+  box.appendChild(copyable("gatekeeper-login --host https://" + location.host));
+  box.appendChild(copyable('curl -H "Authorization: Bearer $(gatekeeper-login --print)" https://' + location.host + "/describe"));
+  hc.appendChild(box);
+}
+
+fetch("/describe", { headers: { Accept: "application/json" } })
+  .then((res) => {
+    if (res.status === 401) { renderSignedOut(); return null; }
+    if (!res.ok) throw new Error("/describe returned " + res.status);
+    return res.json();
+  })
+  .then((d) => { if (d) renderCatalog(d); })
+  .catch((e) => {
+    const c = $("div", "msg", "Could not load the catalog: " + (e.message || e));
+    content.appendChild(c);
+  });
+</script>
+</body>
+</html>

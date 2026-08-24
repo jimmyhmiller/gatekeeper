@@ -62,10 +62,38 @@ Per route:
 | `static`   | serve this directory (exactly one of `static`/`proxy`/`function`) |
 | `proxy`    | reverse-proxy to this `host:port` (exactly one target kind) |
 | `function` | invoke a Rust function dylib in process (exactly one target kind) — see [Serverless functions](#serverless-functions) |
+| `dashboard` | serve the built-in index of everything this gate exposes (exactly one target kind) — see [The dashboard](#the-dashboard) |
 | `public`   | `true` = no auth. **Default `false`.** |
 
 The **token is never in the config file** — it comes from `$GATEKEEPER_TOKEN` or
 `--token-file <path>`. Boot fails if any private route exists and no token is set.
+
+## The dashboard
+
+Point a route at `dashboard = true` and it serves a human-readable index of
+everything the gate exposes: every configured route and whether it is public,
+every function's endpoints (pulled from their own `#[describe]`, with a
+copyable `curl` per endpoint), the reserved built-ins, the scheduled jobs, and
+your enrolled passkeys and device tokens.
+
+```toml
+[[route]]
+path = "/"
+dashboard = true
+public = true
+```
+
+**Public, but it does not leak anything.** The page is a static shell; every
+value it displays is fetched from `/describe`, which is private. Signed out you
+get a sign-in prompt and nothing else — no route names, no endpoint list. That
+matters because `unmatched_status = 404` exists specifically to hide the
+existence of services, and a public index of every route would have quietly
+undone it.
+
+Signed in it is the fastest way to answer "what is actually running here, and
+which of it is exposed". It is the same information as the boot exposure report
+and `/describe`, in the form you want when you are looking at a browser rather
+than a terminal.
 
 ## Serverless functions
 

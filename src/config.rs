@@ -135,6 +135,15 @@ pub struct Route {
     /// Mutually exclusive with `static` and `proxy`.
     #[serde(default)]
     pub function: Option<PathBuf>,
+    /// Serve the built-in dashboard: a human-readable index of everything this
+    /// gate exposes. Mutually exclusive with the other target kinds.
+    ///
+    /// The page itself is a static shell and safe to serve publicly; all of the
+    /// actual contents are fetched from `/describe`, which is private. So a
+    /// signed-out visitor sees a sign-in prompt and learns nothing about what
+    /// routes exist, and `unmatched_status = 404` keeps meaning what it says.
+    #[serde(default)]
+    pub dashboard: bool,
     /// Public routes skip auth. **Defaults to false** — fail safe.
     #[serde(default)]
     pub public: bool,
@@ -146,16 +155,18 @@ pub enum Target {
     Static(PathBuf),
     Proxy(String),
     Function(PathBuf),
+    Dashboard,
 }
 
 impl Route {
     /// The validated target. Exactly one of `static`/`proxy`/`function` must be
     /// set; this is enforced by [`Config::validate`], so here we assume it holds.
     pub fn target(&self) -> Target {
-        match (&self.static_dir, &self.proxy, &self.function) {
-            (Some(dir), None, None) => Target::Static(dir.clone()),
-            (None, Some(up), None) => Target::Proxy(up.clone()),
-            (None, None, Some(lib)) => Target::Function(lib.clone()),
+        match (&self.static_dir, &self.proxy, &self.function, self.dashboard) {
+            (Some(dir), None, None, false) => Target::Static(dir.clone()),
+            (None, Some(up), None, false) => Target::Proxy(up.clone()),
+            (None, None, Some(lib), false) => Target::Function(lib.clone()),
+            (None, None, None, true) => Target::Dashboard,
             // validate() rejects every other combination before we get here.
             _ => unreachable!("route target validated at load time"),
         }
@@ -238,6 +249,7 @@ impl Config {
                 r.static_dir.is_some(),
                 r.proxy.is_some(),
                 r.function.is_some(),
+                r.dashboard,
             ]
             .iter()
             .filter(|b| **b)
@@ -245,14 +257,14 @@ impl Config {
             match set {
                 0 => {
                     return Err(ConfigError(format!(
-                        "route {:?} sets none of 'static', 'proxy', 'function' — pick one",
+                        "route {:?} sets none of 'static', 'proxy', 'function', 'dashboard' — pick one",
                         r.path
                     )));
                 }
                 1 => {}
                 _ => {
                     return Err(ConfigError(format!(
-                        "route {:?} sets more than one of 'static'/'proxy'/'function' — pick one",
+                        "route {:?} sets more than one of 'static'/'proxy'/'function'/'dashboard' — pick one",
                         r.path
                     )));
                 }

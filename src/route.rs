@@ -258,6 +258,7 @@ mod tests {
         Route {
             path: path.to_string(),
             static_dir: Some(std::path::PathBuf::from("/tmp")),
+            dashboard: false,
             proxy: None,
             function: None,
             public,

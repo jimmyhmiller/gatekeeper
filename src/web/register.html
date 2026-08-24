@@ -74,8 +74,17 @@ async function refresh() {
     for (const item of data[key]) {
       const li = document.createElement("li");
       const left = document.createElement("div");
-      left.innerHTML = "<div>" + item.label.replace(/[<>&]/g, "") + "</div>" +
-        "<div class='when'>added " + when(item.added) + "</div>";
+      // textContent, not innerHTML: the label is whatever a human typed at
+      // enrollment. Stripping <>& from it would probably be enough, but
+      // "probably enough escaping" is how XSS happens; not parsing it as
+      // markup at all is not a judgement call.
+      const name = document.createElement("div");
+      name.textContent = item.label;
+      const added = document.createElement("div");
+      added.className = "when";
+      added.textContent = "added " + when(item.added);
+      left.appendChild(name);
+      left.appendChild(added);
       const btn = document.createElement("button");
       btn.className = "danger";
       btn.textContent = "Revoke";
