@@ -11,6 +11,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+
 use gatekeeper::auth::{Authenticator, Verifier};
 use gatekeeper::config::{self, Config, Target};
 use gatekeeper::function::FunctionRegistry;
@@ -390,6 +392,36 @@ fn build_server(
     tiny_http::Server::from_listener(sock, ssl).map_err(|e| format!("starting server: {e}"))
 }
 
+/// Turn an unauthenticated browser navigation into a login round-trip while
+/// leaving API clients with the normal 401. The return target is the raw
+/// same-origin request target, percent-encoded as one query value; it can never
+/// name another origin because tiny_http gives us only path + query here.
+fn browser_login_redirect(
+    method: &str,
+    headers: &[tiny_http::Header],
+    raw_url: &str,
+    login_available: bool,
+) -> Option<Reply> {
+    if !login_available || !matches!(method, "GET" | "HEAD") {
+        return None;
+    }
+    let accepts_html = headers.iter().any(|h| {
+        h.field
+            .as_str()
+            .as_str()
+            .eq_ignore_ascii_case("accept")
+            && h.value
+                .as_str()
+                .split(',')
+                .any(|v| v.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case("text/html"))
+    });
+    if !accepts_html || !raw_url.starts_with('/') || raw_url.starts_with("//") {
+        return None;
+    }
+    let next = utf8_percent_encode(raw_url, NON_ALPHANUMERIC).to_string();
+    Some(Reply::status(303, "").with_header("Location", &format!("/login?next={next}")))
+}
+
 /// Handle a single request: match route, enforce auth on private routes, then
 /// serve static or proxy. Anything unexpected fails closed.
 fn handle(gate: &Gate, mut request: tiny_http::Request) {
@@ -428,6 +460,13 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                         // discovery endpoint explains HOW to authenticate
                         // (never the token itself) so a caller knows what next.
                         describe_auth_help()
+                    } else if let Some(redirect) = browser_login_redirect(
+                        request.method().as_str(),
+                        request.headers(),
+                        &raw_url,
+                        gate.passkeys.is_some(),
+                    ) {
+                        redirect
                     } else {
                         Reply::status(401, "Unauthorized")
                             .with_header("WWW-Authenticate", "Bearer")
@@ -476,8 +515,16 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
             if !route.public {
                 let ok = routing.verifier.check_headers(request.headers());
                 if !ok {
-                    let r = Reply::status(401, "Unauthorized")
-                        .with_header("WWW-Authenticate", "Bearer");
+                    let r = browser_login_redirect(
+                        request.method().as_str(),
+                        request.headers(),
+                        &raw_url,
+                        gate.passkeys.is_some(),
+                    )
+                    .unwrap_or_else(|| {
+                        Reply::status(401, "Unauthorized")
+                            .with_header("WWW-Authenticate", "Bearer")
+                    });
                     let _ = r.respond(request);
                     return;
                 }
@@ -776,4 +823,43 @@ fn describe_auth_help() -> Reply {
     Reply::new(401, body)
         .with_header("Content-Type", "application/json")
         .with_header("WWW-Authenticate", "Bearer")
+}
+
+#[cfg(test)]
+mod browser_redirect_tests {
+    use super::*;
+
+    fn header(name: &str, value: &str) -> tiny_http::Header {
+        tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn html_navigation_redirects_to_login_with_encoded_return_target() {
+        let headers = [header("Accept", "text/html,application/xhtml+xml")];
+        let reply = browser_login_redirect(
+            "GET",
+            &headers,
+            "/files/ox-experiments/?view=full",
+            true,
+        )
+        .expect("browser navigation should redirect");
+        assert_eq!(reply.status, 303);
+        assert_eq!(
+            reply.headers,
+            vec![(
+                "Location".into(),
+                "/login?next=%2Ffiles%2Fox%2Dexperiments%2F%3Fview%3Dfull".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn api_requests_and_disabled_login_keep_the_401_path() {
+        let json = [header("Accept", "application/json")];
+        assert!(browser_login_redirect("GET", &json, "/private", true).is_none());
+        let html = [header("Accept", "text/html")];
+        assert!(browser_login_redirect("POST", &html, "/private", true).is_none());
+        assert!(browser_login_redirect("GET", &html, "/private", false).is_none());
+        assert!(browser_login_redirect("GET", &html, "//evil.example/", true).is_none());
+    }
 }

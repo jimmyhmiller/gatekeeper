@@ -56,8 +56,20 @@ summary { cursor:pointer; color:var(--muted); font-size:.85rem; }
 <script>
 const params = new URLSearchParams(location.search);
 const deviceCode = params.get("code");
+const requestedNext = params.get("next");
 const msg = document.getElementById("msg");
 const passkeyBtn = document.getElementById("passkey");
+
+// Accept same-origin absolute paths only. In particular, reject protocol-
+// relative URLs (`//host`), backslashes (which URL parsers may treat as path
+// separators), and controls. The server only generates safe values, but login
+// is public and a malicious site can construct its own query string.
+function returnTarget() {
+  if (!requestedNext || !requestedNext.startsWith("/") ||
+      requestedNext.startsWith("//") || requestedNext.includes("\\") ||
+      /[\u0000-\u001f\u007f]/.test(requestedNext)) return "/";
+  return requestedNext;
+}
 
 function show(kind, text) { msg.className = "msg " + kind; msg.textContent = text; }
 function clear() { msg.className = "msg"; msg.textContent = ""; }
@@ -77,9 +89,10 @@ if (!window.PublicKeyCredential) {
   document.getElementById("fallback").open = true;
 }
 
-// After any successful sign-in: either approve the waiting CLI, or go home.
+// After any successful sign-in: either approve the waiting CLI, or return to
+// the private page that sent this browser here.
 async function afterAuth() {
-  if (!deviceCode) { location.href = "/"; return; }
+  if (!deviceCode) { location.href = returnTarget(); return; }
   const label = document.getElementById("devicelabel").value;
   await postJSON("/login/device/approve", { user_code: deviceCode, label: label });
   show("ok", "Device approved. You can go back to your terminal.");
