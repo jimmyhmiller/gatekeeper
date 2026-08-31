@@ -21,6 +21,8 @@
 //!   [`GK_ABI_VERSION`]. The gate refuses to load a mismatched dylib.
 //! - [`GK_HANDLE_SYMBOL`] — `extern "C" fn(*const GkRequest) -> *mut GkResponse`.
 //! - [`GK_FREE_SYMBOL`] — `extern "C" fn(*mut GkResponse)` to free a response.
+//! - [`GK_STREAM_READ_SYMBOL`] — reads the next bytes from a streaming body.
+//! - [`GK_STREAM_FREE_SYMBOL`] — releases a streaming body after EOF, error, or disconnect.
 //!
 //! The `gatekeeper-fn` SDK generates all three for you from a single handler;
 //! you should not hand-write them.
@@ -37,7 +39,15 @@ use std::os::raw::c_char;
 /// function must export it (the SDK's `#[describe]` does so) — the gate refuses
 /// to load a dylib without it, so the `/describe` catalog is complete
 /// by construction and no function can be silently undocumented.
-pub const GK_ABI_VERSION: u32 = 2;
+///
+/// v3: responses can carry either a complete buffered body or an opaque
+/// streaming body. Stream callbacks are deliberately pull-based: the gate does
+/// not let a function write directly to its client socket, so it can enforce
+/// backpressure and own disconnect handling.
+pub const GK_ABI_VERSION: u32 = 3;
+
+pub const GK_BODY_BUFFERED: u32 = 0;
+pub const GK_BODY_STREAM: u32 = 1;
 
 /// Name of the exported version function: `extern "C" fn() -> u32`.
 pub const GK_ABI_VERSION_SYMBOL: &[u8] = b"gk_abi_version";
@@ -45,6 +55,11 @@ pub const GK_ABI_VERSION_SYMBOL: &[u8] = b"gk_abi_version";
 pub const GK_HANDLE_SYMBOL: &[u8] = b"gk_handle";
 /// Name of the exported deallocator: `extern "C" fn(*mut GkResponse)`.
 pub const GK_FREE_SYMBOL: &[u8] = b"gk_free";
+/// `extern "C" fn(*mut c_void, *mut u8, usize) -> isize`.
+/// Positive values are bytes written, zero is EOF, and negative is an error.
+pub const GK_STREAM_READ_SYMBOL: &[u8] = b"gk_stream_read";
+/// `extern "C" fn(*mut c_void)`. Called exactly once for every non-null stream.
+pub const GK_STREAM_FREE_SYMBOL: &[u8] = b"gk_stream_free";
 /// Name of the REQUIRED self-description function:
 /// `extern "C" fn() -> *mut GkResponse`.
 ///
@@ -131,4 +146,10 @@ pub struct GkResponse {
     /// Owned body bytes. May be null iff `body_len == 0`.
     pub body_ptr: *mut u8,
     pub body_len: usize,
+    /// [`GK_BODY_BUFFERED`] or [`GK_BODY_STREAM`].
+    pub body_kind: u32,
+    /// Function-owned opaque state for a streaming body. The response envelope
+    /// does not own it: after copying the envelope, the gate calls `gk_free`,
+    /// then eventually releases this state through `gk_stream_free`.
+    pub stream_ptr: *mut std::ffi::c_void,
 }

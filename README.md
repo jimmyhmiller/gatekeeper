@@ -61,7 +61,7 @@ Per route:
 | `path`     | path prefix, e.g. `/blog`. Must start with `/`, no trailing `/`. |
 | `static`   | serve this directory (exactly one of `static`/`proxy`/`function`) |
 | `proxy`    | reverse-proxy to this `host:port` (exactly one target kind) |
-| `function` | invoke a Rust function dylib in process (exactly one target kind) — see [Serverless functions](#serverless-functions) |
+| `function` | invoke a native function dylib in process (exactly one target kind) — see [Serverless functions](#serverless-functions) |
 | `dashboard` | serve the built-in index of everything this gate exposes (exactly one target kind) — see [The dashboard](#the-dashboard) |
 | `public`   | `true` = no auth. **Default `false`.** |
 
@@ -171,15 +171,49 @@ function = "target/release/libhello_fn.so"   # .dylib on macOS, .dll on Windows
 # 'public' omitted -> PRIVATE, like any other route (default-deny holds)
 ```
 
+The string form is a hot-reloadable, request-scoped function. A function that
+owns background threads or other process-lifetime state must declare the
+service lifecycle:
+
+```toml
+[[route]]
+path = "/agents"
+function = { library = "/opt/functions/libcoil_agent_harness.dylib", lifecycle = "service" }
+# private by default
+```
+
+Service functions are loaded once and pinned until Gatekeeper exits. Replacing
+their file does not reload or unmap the running image; restart Gatekeeper to
+deploy a new version. This prevents background work from continuing in an
+unmapped library. Ordinary string-form functions retain automatic hot reload.
+
 `req.path()` is the path **after** the route prefix (so `/api/health` arrives as
 `/health`), already normalized and traversal-checked by the gate. You get
 `method()`, `query()`, `headers()`/`header(name)`, and `body()`/`text()`;
-`Response` has `text`/`json`/`html`/`status`/`new` plus a `header(...)` builder.
+`Response` has `text`/`json`/`html`/`status`/`new`, a `header(...)` builder, and
+`Response::stream(status, reader)` for incremental bodies such as SSE. A stream
+reader is pulled only as the client can accept bytes, and is dropped on EOF,
+read error, or client disconnect.
+
+```rust
+Response::stream(200, event_reader)
+    .header("Content-Type", "text/event-stream")
+    .header("Cache-Control", "no-cache")
+```
+
+Streaming is ABI v3: `GkResponse` identifies a buffered or streaming body, and
+the gate calls `gk_stream_read` repeatedly before calling `gk_stream_free`
+exactly once. The response envelope itself is still released immediately with
+`gk_free`. This split lets the function retain only stream state while the gate
+owns HTTP framing, chunking, backpressure, and disconnect detection. An
+in-flight stream holds the loaded library alive, including across an ordinary
+function hot reload.
 
 ### How it works (and why it's safe to run in process)
 
-The `#[handler]` macro generates a tiny C-ABI surface (`gk_handle` / `gk_free` /
-`gk_abi_version`) — defined in the `gatekeeper-abi` crate, the *entire* contract
+The `#[handler]` macro generates a tiny C-ABI surface (`gk_handle`, `gk_free`,
+`gk_stream_read`, `gk_stream_free`, and `gk_abi_version`) — defined in the
+`gatekeeper-abi` crate, the *entire* contract
 across the boundary. The gate `dlopen`s the dylib, **checks its ABI version and
 refuses to call a mismatch**, marshals the request into `#[repr(C)]` structs,
 calls the handler, copies the response out, and frees it back through the dylib's

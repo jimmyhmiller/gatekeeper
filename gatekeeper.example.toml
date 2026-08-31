@@ -25,3 +25,9 @@ proxy = "127.0.0.1:5557"
 [[route]]
 path = "/api"
 function = "target/release/libhello_fn.so"
+
+# Long-lived functions that own background threads use the structured service
+# form. They stay mapped until Gatekeeper exits and update on process restart.
+# [[route]]
+# path = "/agents"
+# function = { library = "/opt/functions/libcoil_agent_harness.dylib", lifecycle = "service" }

@@ -16,7 +16,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tiny_http = { version = "0.12", features = ["ssl-rustls"] }
+# Local fork: streaming bodies must flush each producer read so SSE events are
+# observable immediately instead of waiting for tiny_http's 8 KiB chunk buffer.
+tiny_http = { path = "crates/tiny-http", features = ["ssl-rustls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"

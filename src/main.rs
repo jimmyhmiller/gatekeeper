@@ -514,15 +514,15 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                     // Proxy the full URL (path + query) so upstreams see queries.
                     proxy::forward(&upstream, &method, &raw_url, request.headers(), &body)
                 }
-                Target::Function(lib) => {
+                Target::Function(function) => {
                     // Read the body, then invoke the dylib in process. `rest` is
                     // the path after the route prefix (already normalized); the
                     // function sees that plus the query separately.
                     let mut body = Vec::new();
                     let _ = request.as_reader().read_to_end(&mut body);
                     let method = request.method().as_str().to_string();
-                    gate.functions.invoke(
-                        &lib,
+                    gate.functions.invoke_target(
+                        &function,
                         &method,
                         &rest,
                         &query,
@@ -635,7 +635,13 @@ fn target_desc(r: &config::Route) -> String {
     match (&r.static_dir, &r.proxy, &r.function) {
         (Some(d), _, _) => format!("static {}", d.display()),
         (_, Some(u), _) => format!("proxy {u}"),
-        (_, _, Some(l)) => format!("function {}", l.display()),
+        (_, _, Some(function)) => {
+            let lifecycle = match function.lifecycle() {
+                config::FunctionLifecycle::Reloadable => "reloadable",
+                config::FunctionLifecycle::Service => "service",
+            };
+            format!("function {} ({lifecycle})", function.library().display())
+        }
         _ if r.dashboard => "dashboard (built-in index)".into(),
         _ => "(invalid)".into(),
     }
@@ -664,9 +670,16 @@ fn describe_catalog(gate: &Gate, routing: &Routing) -> Reply {
         // For a function route, fetch and embed its self-description. The
         // function's endpoint paths are RELATIVE to this route's prefix, so we
         // also surface the prefix to make the full path obvious.
-        if let Some(lib) = &r.function {
+        if let Some(function) = &r.function {
             entry["kind"] = json!("function");
-            match gate.functions.describe(lib) {
+            entry["lifecycle"] = json!(match function.lifecycle() {
+                config::FunctionLifecycle::Reloadable => "reloadable",
+                config::FunctionLifecycle::Service => "service",
+            });
+            match gate
+                .functions
+                .describe_with_lifecycle(function.library(), function.lifecycle())
+            {
                 Ok(desc_json) => {
                     // The function returned JSON text; embed it parsed if valid,
                     // else surface the raw string so nothing is silently lost.

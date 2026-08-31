@@ -139,6 +139,20 @@ fn repeated_invocations_reuse_cached_library() {
 }
 
 #[test]
+fn streaming_response_crosses_the_native_abi() {
+    let reg = FunctionRegistry::new();
+    let response = reg.invoke(&dylib_path(), "GET", "/sse", "", &[], &[]);
+    assert_eq!(response.status, 200);
+    assert!(response.is_stream());
+    assert!(response
+        .headers
+        .iter()
+        .any(|(name, value)| name == "Content-Type" && value == "text/event-stream"));
+    // Dropping the Reply without consuming it exercises disconnect cleanup:
+    // the gate returns the opaque reader to the function's gk_stream_free.
+}
+
+#[test]
 fn missing_dylib_fails_closed() {
     let reg = FunctionRegistry::new();
     let r = reg.invoke(

@@ -79,11 +79,15 @@ impl Request {
 }
 
 /// The response your handler returns.
-#[derive(Debug, Clone)]
 pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: ResponseBody,
+}
+
+pub(crate) enum ResponseBody {
+    Buffered(Vec<u8>),
+    Stream(Box<dyn std::io::Read + Send>),
 }
 
 impl Response {
@@ -92,7 +96,17 @@ impl Response {
         Response {
             status,
             headers: Vec::new(),
-            body: body.into(),
+            body: ResponseBody::Buffered(body.into()),
+        }
+    }
+    /// A response whose body is pulled incrementally by Gatekeeper. Reads are
+    /// naturally backpressured by the client connection; dropping the reader
+    /// signals EOF, an error, or client disconnect.
+    pub fn stream(status: u16, body: impl std::io::Read + Send + 'static) -> Self {
+        Response {
+            status,
+            headers: Vec::new(),
+            body: ResponseBody::Stream(Box::new(body)),
         }
     }
     /// `200 OK` with a `text/plain` body.
