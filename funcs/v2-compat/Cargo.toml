@@ -1,0 +1,8 @@
+[package]
+name = "v2-compat-fn"
+version = "0.1.0"
+edition = "2021"
+description = "Frozen Gatekeeper ABI v2 fixture for backward-compatibility tests."
+
+[lib]
+crate-type = ["cdylib"]

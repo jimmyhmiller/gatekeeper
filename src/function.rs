@@ -26,8 +26,8 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::os::raw::c_char;
 use std::io::{self, Read};
+use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
 
 use gatekeeper_abi::{
@@ -48,12 +48,13 @@ struct LoadedFn {
     // `_lib` last.
     handle: HandleFn,
     free: FreeFn,
+    abi_version: u32,
     /// Required self-description symbol (ABI v2): every function must export
     /// `gk_describe` (via the SDK's `#[describe]`), so the describe catalog is
     /// always complete. Resolved at load time; a missing one fails the load.
     describe: DescribeFn,
-    stream_read: StreamReadFn,
-    stream_free: StreamFreeFn,
+    stream_read: Option<StreamReadFn>,
+    stream_free: Option<StreamFreeFn>,
     _lib: libloading::Library,
     /// Each version is loaded from a UNIQUE private copy of the dylib (see
     /// `load_library`), so the dynamic linker treats a reloaded build as a
@@ -76,15 +77,31 @@ impl Drop for LoadedFn {
 }
 
 type VersionFn = unsafe extern "C" fn() -> u32;
-type DescribeFn = unsafe extern "C" fn() -> *mut GkResponse;
-type HandleFn = unsafe extern "C" fn(*const GkRequest) -> *mut GkResponse;
-type FreeFn = unsafe extern "C" fn(*mut GkResponse);
+type DescribeFn = unsafe extern "C" fn() -> *mut std::ffi::c_void;
+type HandleFn = unsafe extern "C" fn(*const GkRequest) -> *mut std::ffi::c_void;
+type FreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
 type StreamReadFn = unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, usize) -> isize;
 type StreamFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
 
+const GK_ABI_VERSION_V2: u32 = 2;
+
+/// Frozen response layout from ABI v2. Requests and headers did not change in
+/// v3, but responses gained body discrimination and stream state. Keeping the
+/// old layout explicit lets the gate safely serve existing buffered functions.
+#[repr(C)]
+struct GkResponseV2 {
+    status: u16,
+    headers_ptr: *mut GkHeader,
+    header_count: usize,
+    body_ptr: *mut u8,
+    body_len: usize,
+}
+
 struct FunctionStream {
     state: *mut std::ffi::c_void,
-    func: Arc<LoadedFn>,
+    _func: Arc<LoadedFn>,
+    read: StreamReadFn,
+    free: StreamFreeFn,
     done: bool,
 }
 
@@ -95,7 +112,7 @@ impl Read for FunctionStream {
         if self.done || buf.is_empty() {
             return Ok(0);
         }
-        let count = unsafe { (self.func.stream_read)(self.state, buf.as_mut_ptr(), buf.len()) };
+        let count = unsafe { (self.read)(self.state, buf.as_mut_ptr(), buf.len()) };
         if count < 0 {
             self.done = true;
             Err(io::Error::other("function stream read failed"))
@@ -120,7 +137,7 @@ impl Read for FunctionStream {
 impl Drop for FunctionStream {
     fn drop(&mut self) {
         if !self.state.is_null() {
-            unsafe { (self.func.stream_free)(self.state) };
+            unsafe { (self.free)(self.state) };
             self.state = std::ptr::null_mut();
         }
     }
@@ -199,7 +216,9 @@ impl FunctionRegistry {
     ) -> Reply {
         let func = match self.get_or_load(lib_path, FunctionLifecycle::Reloadable) {
             Ok(f) => f,
-            Err(e) => return Reply::status(502, &format!("Bad Gateway: function load failed: {e}")),
+            Err(e) => {
+                return Reply::status(502, &format!("Bad Gateway: function load failed: {e}"))
+            }
         };
         call_function(func, method, path, query, headers, body)
     }
@@ -215,7 +234,9 @@ impl FunctionRegistry {
     ) -> Reply {
         let func = match self.get_or_load(lib_path, FunctionLifecycle::Service) {
             Ok(f) => f,
-            Err(e) => return Reply::status(502, &format!("Bad Gateway: function load failed: {e}")),
+            Err(e) => {
+                return Reply::status(502, &format!("Bad Gateway: function load failed: {e}"))
+            }
         };
         call_function(func, method, path, query, headers, body)
     }
@@ -302,9 +323,8 @@ impl FunctionRegistry {
             if let Some(entry) = map.get(&key) {
                 return Ok(std::sync::Arc::clone(&entry.func));
             }
-            let stamp = FileStamp::of(lib_path).ok_or_else(|| {
-                format!("cannot stat service function {}", lib_path.display())
-            })?;
+            let stamp = FileStamp::of(lib_path)
+                .ok_or_else(|| format!("cannot stat service function {}", lib_path.display()))?;
             let func = std::sync::Arc::new(load_library(lib_path, true)?);
             map.insert(
                 key,
@@ -345,7 +365,13 @@ impl FunctionRegistry {
                 let stamp = pre_stamp.or(disk);
                 let mut map = self.loaded.lock().unwrap();
                 if let Some(stamp) = stamp {
-                    map.insert(key, CacheEntry { func: std::sync::Arc::clone(&func), stamp });
+                    map.insert(
+                        key,
+                        CacheEntry {
+                            func: std::sync::Arc::clone(&func),
+                            stamp,
+                        },
+                    );
                 } else {
                     // No stamp available at all (file vanished mid-flight); serve
                     // this load but don't cache it under an unknown identity.
@@ -425,10 +451,7 @@ fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, St
     // (same trust level as a proxy upstream — see module docs).
     let lib = unsafe {
         use libloading::os::unix as ldunix;
-        match ldunix::Library::open(
-            Some(&temp_path),
-            ldunix::RTLD_NOW | ldunix::RTLD_LOCAL,
-        ) {
+        match ldunix::Library::open(Some(&temp_path), ldunix::RTLD_NOW | ldunix::RTLD_LOCAL) {
             Ok(l) => libloading::Library::from(l),
             Err(e) => {
                 let _ = std::fs::remove_file(&temp_path);
@@ -458,10 +481,10 @@ fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, St
         };
 
         let got = unsafe { version() };
-        if got != GK_ABI_VERSION {
+        if got != GK_ABI_VERSION_V2 && got != GK_ABI_VERSION {
             return Err(format!(
-                "ABI version mismatch: dylib reports {got}, gate expects {GK_ABI_VERSION} \
-                 (rebuild the function against this gatekeeper)"
+                "ABI version mismatch: dylib reports {got}, gate supports \
+                 {GK_ABI_VERSION_V2} and {GK_ABI_VERSION}"
             ));
         }
 
@@ -474,13 +497,18 @@ fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, St
                 format!("symbol gk_describe: {e} (every function must have a #[describe])")
             })?
         };
-        let stream_read: StreamReadFn = unsafe {
-            *lib.get(GK_STREAM_READ_SYMBOL)
-                .map_err(|e| format!("symbol gk_stream_read: {e}"))?
-        };
-        let stream_free: StreamFreeFn = unsafe {
-            *lib.get(GK_STREAM_FREE_SYMBOL)
-                .map_err(|e| format!("symbol gk_stream_free: {e}"))?
+        let (stream_read, stream_free) = if got == GK_ABI_VERSION {
+            let read: StreamReadFn = unsafe {
+                *lib.get(GK_STREAM_READ_SYMBOL)
+                    .map_err(|e| format!("symbol gk_stream_read: {e}"))?
+            };
+            let free: StreamFreeFn = unsafe {
+                *lib.get(GK_STREAM_FREE_SYMBOL)
+                    .map_err(|e| format!("symbol gk_stream_free: {e}"))?
+            };
+            (Some(read), Some(free))
+        } else {
+            (None, None)
         };
 
         if pinned {
@@ -491,11 +519,16 @@ fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, St
         Ok(LoadedFn {
             handle,
             free,
+            abi_version: got,
             describe,
             stream_read,
             stream_free,
             _lib: lib,
-            temp_path: if pinned { None } else { Some(temp_path.clone()) },
+            temp_path: if pinned {
+                None
+            } else {
+                Some(temp_path.clone())
+            },
         })
     })();
 
@@ -590,8 +623,12 @@ fn call_function(
 ///
 /// # Safety
 /// `resp_ptr` must be a non-null pointer returned by the function's `gk_handle`.
-unsafe fn copy_response(resp_ptr: *const GkResponse, func: Arc<LoadedFn>) -> Reply {
-    let resp = &*resp_ptr;
+unsafe fn copy_response(resp_ptr: *const std::ffi::c_void, func: Arc<LoadedFn>) -> Reply {
+    if func.abi_version == GK_ABI_VERSION_V2 {
+        return copy_response_v2(resp_ptr.cast::<GkResponseV2>());
+    }
+
+    let resp = &*resp_ptr.cast::<GkResponse>();
 
     let mut reply = match resp.body_kind {
         GK_BODY_BUFFERED => {
@@ -606,7 +643,13 @@ unsafe fn copy_response(resp_ptr: *const GkResponse, func: Arc<LoadedFn>) -> Rep
             resp.status,
             Box::new(FunctionStream {
                 state: resp.stream_ptr,
-                func,
+                read: func
+                    .stream_read
+                    .expect("ABI v3 libraries are loaded with gk_stream_read"),
+                free: func
+                    .stream_free
+                    .expect("ABI v3 libraries are loaded with gk_stream_free"),
+                _func: func,
                 done: false,
             }),
         ),
@@ -614,6 +657,31 @@ unsafe fn copy_response(resp_ptr: *const GkResponse, func: Arc<LoadedFn>) -> Rep
         _ => Reply::status(500, "function returned an unknown body kind"),
     };
 
+    if !resp.headers_ptr.is_null() {
+        let hdrs = std::slice::from_raw_parts(resp.headers_ptr, resp.header_count);
+        for h in hdrs {
+            let name = bytes_to_string(h.name_ptr, h.name_len);
+            let value = bytes_to_string(h.value_ptr, h.value_len);
+            if !name.is_empty() {
+                reply = reply.with_header(&name, &value);
+            }
+        }
+    }
+    reply
+}
+
+/// Copy the frozen buffered response layout used by ABI v2.
+///
+/// # Safety
+/// `resp_ptr` must point to a non-null response returned by an ABI v2 function.
+unsafe fn copy_response_v2(resp_ptr: *const GkResponseV2) -> Reply {
+    let resp = &*resp_ptr;
+    let body = if resp.body_ptr.is_null() || resp.body_len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(resp.body_ptr, resp.body_len).to_vec()
+    };
+    let mut reply = Reply::new(resp.status, body);
     if !resp.headers_ptr.is_null() {
         let hdrs = std::slice::from_raw_parts(resp.headers_ptr, resp.header_count);
         for h in hdrs {

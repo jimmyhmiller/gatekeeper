@@ -33,7 +33,11 @@ fn dylib_path() -> PathBuf {
     // tests run from the crate root; the workspace target dir is ./target.
     let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(if cfg!(debug_assertions) { "debug" } else { "release" })
+        .join(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        })
         .join(&name);
     assert!(
         p.exists(),
@@ -41,6 +45,35 @@ fn dylib_path() -> PathBuf {
         p.display()
     );
     p
+}
+
+fn v2_dylib_path() -> PathBuf {
+    let ext = if cfg!(target_os = "macos") {
+        "dylib"
+    } else if cfg!(target_os = "windows") {
+        "dll"
+    } else {
+        "so"
+    };
+    let name = if cfg!(target_os = "windows") {
+        format!("v2_compat_fn.{ext}")
+    } else {
+        format!("libv2_compat_fn.{ext}")
+    };
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        })
+        .join(name);
+    assert!(
+        path.exists(),
+        "ABI v2 fixture not built at {} — run `cargo build -p v2-compat-fn` first",
+        path.display()
+    );
+    path
 }
 
 fn hdr(name: &str, value: &str) -> tiny_http::Header {
@@ -86,10 +119,26 @@ fn describe_returns_self_description() {
         .describe(&lib)
         .expect("hello exports gk_describe (required) -> json");
     assert!(desc.contains("\"name\":\"hello\""), "got: {desc}");
-    assert!(desc.contains("\"/health\""), "should list the /health endpoint: {desc}");
+    assert!(
+        desc.contains("\"/health\""),
+        "should list the /health endpoint: {desc}"
+    );
     // It must be valid JSON.
     let v: serde_json::Value = serde_json::from_str(&desc).expect("describe is valid JSON");
     assert!(v.get("endpoints").and_then(|e| e.as_array()).is_some());
+}
+
+#[test]
+fn abi_v2_buffered_function_remains_compatible() {
+    let reg = FunctionRegistry::new();
+    let lib = v2_dylib_path();
+    let response = reg.invoke(&lib, "GET", "/legacy", "", &[], &[]);
+    assert_eq!(response.status, 200);
+    assert_eq!(response.body, b"v2 buffered response for /legacy");
+    assert!(!response.is_stream());
+
+    let description = reg.describe(&lib).expect("ABI v2 description loads");
+    assert!(description.contains("\"name\":\"v2-compat\""));
 }
 
 #[test]
@@ -99,7 +148,11 @@ fn function_without_describe_is_rejected() {
     // Err), guaranteeing the catalog can never have an undocumented function.
     let lib = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("target")
-        .join(if cfg!(debug_assertions) { "debug" } else { "release" })
+        .join(if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        })
         .join("libnodescribe_fn.so");
     if !lib.exists() {
         // Built by `cargo build -p nodescribe-fn`; skip cleanly if absent.
@@ -108,7 +161,10 @@ fn function_without_describe_is_rejected() {
     }
     let reg = FunctionRegistry::new();
     let r = reg.invoke(&lib, "GET", "/x", "", &[], &[]);
-    assert_eq!(r.status, 502, "a function without #[describe] must fail to load");
+    assert_eq!(
+        r.status, 502,
+        "a function without #[describe] must fail to load"
+    );
     assert!(
         reg.describe(&lib).is_err(),
         "describe() on a no-describe dylib must error, not silently succeed"

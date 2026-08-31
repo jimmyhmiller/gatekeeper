@@ -8,6 +8,7 @@ members = [
     "funcs/analytics",
     "funcs/polls",
     "funcs/nodescribe",
+    "funcs/v2-compat",
 ]
 
 [package]

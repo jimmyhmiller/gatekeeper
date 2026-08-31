@@ -209,6 +209,12 @@ owns HTTP framing, chunking, backpressure, and disconnect detection. An
 in-flight stream holds the loaded library alive, including across an ordinary
 function hot reload.
 
+Gatekeeper remains backward-compatible with ABI v2 functions. It reads their
+original buffered-response layout and does not require the v3 stream symbols;
+existing deployed functions therefore keep working unchanged. New SDK builds
+emit ABI v3 so they can opt into streaming. Versions other than 2 and 3 are
+rejected before any request or response structure is accessed.
+
 ### How it works (and why it's safe to run in process)
 
 The `#[handler]` macro generates a tiny C-ABI surface (`gk_handle`, `gk_free`,
