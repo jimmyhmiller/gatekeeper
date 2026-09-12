@@ -17,7 +17,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub use gatekeeper_abi::{GkHeader, GkRequest, GkResponse};
 
-use crate::{Request, Response};
+use crate::{Request, Response, ResponseBody};
 
 /// Reported to the gate so it can refuse a dylib built against a different ABI.
 pub fn abi_version() -> u32 {
@@ -90,7 +90,7 @@ pub unsafe fn free(resp: *mut GkResponse) {
     }
 
     // Reconstruct the body Vec<u8> so it drops.
-    if !boxed.body_ptr.is_null() {
+    if boxed.body_kind == gatekeeper_abi::GK_BODY_BUFFERED && !boxed.body_ptr.is_null() {
         drop(Vec::from_raw_parts(boxed.body_ptr, boxed.body_len, boxed.body_len));
     }
     // `boxed` drops here, freeing the GkResponse itself.
@@ -146,12 +146,29 @@ fn into_raw_response(resp: Response) -> *mut GkResponse {
         hdrs.as_mut_ptr()
     };
 
-    let (body_ptr, body_len) = if resp.body.is_empty() {
-        (std::ptr::null_mut(), 0)
-    } else {
-        let mut body = std::mem::ManuallyDrop::new(resp.body);
-        body.shrink_to_fit();
-        (body.as_mut_ptr(), body.len())
+    let (body_ptr, body_len, body_kind, stream_ptr) = match resp.body {
+        ResponseBody::Buffered(body) if body.is_empty() => (
+            std::ptr::null_mut(),
+            0,
+            gatekeeper_abi::GK_BODY_BUFFERED,
+            std::ptr::null_mut(),
+        ),
+        ResponseBody::Buffered(body) => {
+            let mut body = std::mem::ManuallyDrop::new(body);
+            body.shrink_to_fit();
+            (
+                body.as_mut_ptr(),
+                body.len(),
+                gatekeeper_abi::GK_BODY_BUFFERED,
+                std::ptr::null_mut(),
+            )
+        }
+        ResponseBody::Stream(reader) => (
+            std::ptr::null_mut(),
+            0,
+            gatekeeper_abi::GK_BODY_STREAM,
+            Box::into_raw(Box::new(reader)) as *mut std::ffi::c_void,
+        ),
     };
 
     Box::into_raw(Box::new(GkResponse {
@@ -160,7 +177,31 @@ fn into_raw_response(resp: Response) -> *mut GkResponse {
         header_count,
         body_ptr,
         body_len,
+        body_kind,
+        stream_ptr,
     }))
+}
+
+pub unsafe fn stream_read(
+    stream: *mut std::ffi::c_void,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    if stream.is_null() || output.is_null() || capacity == 0 {
+        return -1;
+    }
+    let reader = &mut *(stream as *mut Box<dyn std::io::Read + Send>);
+    let buffer = std::slice::from_raw_parts_mut(output, capacity);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| reader.read(buffer))) {
+        Ok(Ok(count)) => count as isize,
+        _ => -1,
+    }
+}
+
+pub unsafe fn stream_free(stream: *mut std::ffi::c_void) {
+    if !stream.is_null() {
+        drop(Box::from_raw(stream as *mut Box<dyn std::io::Read + Send>));
+    }
 }
 
 /// Leak a String's bytes, returning (ptr, len). Reclaimed in [`free`] via

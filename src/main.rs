@@ -14,6 +14,7 @@ use std::sync::Arc;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
 use gatekeeper::auth::{Authenticator, Verifier};
+use gatekeeper::oidc::GitHubOidcVerifier;
 use gatekeeper::config::{self, Config, Target};
 use gatekeeper::function::FunctionRegistry;
 use gatekeeper::login;
@@ -21,6 +22,7 @@ use gatekeeper::passkey::PasskeyEngine;
 use gatekeeper::proxy;
 use gatekeeper::ratelimit::RateLimiter;
 use gatekeeper::reply::Reply;
+use gatekeeper::release_store::ReleaseStore;
 use gatekeeper::route::{Match, Router};
 use gatekeeper::schedule::Scheduler;
 use gatekeeper::serve;
@@ -235,7 +237,12 @@ fn build_routing(
 ) -> Routing {
     Routing {
         router: Router::new(cfg.route.clone()),
-        verifier: Verifier::new(token.map(Authenticator::new), passkeys),
+        verifier: Verifier::new(token.map(Authenticator::new), passkeys).with_github_oidc(
+            cfg.github_oidc
+                .clone()
+                .map(GitHubOidcVerifier::new)
+                .map(Arc::new),
+        ),
         unmatched_status: cfg.unmatched_status,
         tls: cfg.tls_enabled(),
         jobs: cfg.job.clone(),
@@ -511,10 +518,19 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
         Match::BadPath => Reply::status(400, "Bad Request"),
         Match::NoRoute => Reply::status(routing.unmatched_status, "Not Found"),
         Match::Route { route, rest, .. } => {
+            let target = route.target();
+            let auth = if route.public {
+                None
+            } else {
+                routing.verifier.authenticate_headers(request.headers())
+            };
             // The safety gate: private routes require a valid token.
             if !route.public {
-                let ok = routing.verifier.check_headers(request.headers());
-                if !ok {
+                let route_scopes_apply = !matches!(target, Target::ReleaseStore(_));
+                if auth.is_none()
+                    || (route_scopes_apply
+                        && !auth.as_ref().is_some_and(|a| a.allows(&route.scopes)))
+                {
                     let r = browser_login_redirect(
                         request.method().as_str(),
                         request.headers(),
@@ -529,7 +545,7 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                     return;
                 }
             }
-            match route.target() {
+            match target {
                 // A static shell. Everything it displays comes from /describe,
                 // which is private, so this is safe to serve to anyone: signed
                 // out, the page shows a sign-in prompt and nothing else.
@@ -561,15 +577,15 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                     // Proxy the full URL (path + query) so upstreams see queries.
                     proxy::forward(&upstream, &method, &raw_url, request.headers(), &body)
                 }
-                Target::Function(lib) => {
+                Target::Function(function) => {
                     // Read the body, then invoke the dylib in process. `rest` is
                     // the path after the route prefix (already normalized); the
                     // function sees that plus the query separately.
                     let mut body = Vec::new();
                     let _ = request.as_reader().read_to_end(&mut body);
                     let method = request.method().as_str().to_string();
-                    gate.functions.invoke(
-                        &lib,
+                    gate.functions.invoke_target(
+                        &function,
                         &method,
                         &rest,
                         &query,
@@ -577,6 +593,25 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                         &body,
                     )
                 }
+                Target::ReleaseStore(config) => match ReleaseStore::new(config) {
+                    Err(error) => {
+                        eprintln!("gatekeeper: release store initialization failed: {error}");
+                        Reply::status(500, "release store failure")
+                    }
+                    Ok(store) => {
+                        let method = request.method().as_str().to_string();
+                        let headers = request.headers().to_vec();
+                        let length = request.body_length();
+                        store.handle(
+                            auth.as_ref().expect("release stores are private"),
+                            &method,
+                            &rest,
+                            &headers,
+                            length,
+                            request.as_reader(),
+                        )
+                    }
+                },
             }
         }
     };
@@ -679,10 +714,17 @@ fn print_exposure_report(
 }
 
 fn target_desc(r: &config::Route) -> String {
-    match (&r.static_dir, &r.proxy, &r.function) {
-        (Some(d), _, _) => format!("static {}", d.display()),
-        (_, Some(u), _) => format!("proxy {u}"),
-        (_, _, Some(l)) => format!("function {}", l.display()),
+    match (&r.static_dir, &r.proxy, &r.function, &r.release_store) {
+        (Some(d), _, _, _) => format!("static {}", d.display()),
+        (_, Some(u), _, _) => format!("proxy {u}"),
+        (_, _, Some(function), _) => {
+            let lifecycle = match function.lifecycle() {
+                config::FunctionLifecycle::Reloadable => "reloadable",
+                config::FunctionLifecycle::Service => "service",
+            };
+            format!("function {} ({lifecycle})", function.library().display())
+        }
+        (_, _, _, Some(store)) => format!("release store {}", store.root.display()),
         _ if r.dashboard => "dashboard (built-in index)".into(),
         _ => "(invalid)".into(),
     }
@@ -711,9 +753,16 @@ fn describe_catalog(gate: &Gate, routing: &Routing) -> Reply {
         // For a function route, fetch and embed its self-description. The
         // function's endpoint paths are RELATIVE to this route's prefix, so we
         // also surface the prefix to make the full path obvious.
-        if let Some(lib) = &r.function {
+        if let Some(function) = &r.function {
             entry["kind"] = json!("function");
-            match gate.functions.describe(lib) {
+            entry["lifecycle"] = json!(match function.lifecycle() {
+                config::FunctionLifecycle::Reloadable => "reloadable",
+                config::FunctionLifecycle::Service => "service",
+            });
+            match gate
+                .functions
+                .describe_with_lifecycle(function.library(), function.lifecycle())
+            {
                 Ok(desc_json) => {
                     // The function returned JSON text; embed it parsed if valid,
                     // else surface the raw string so nothing is silently lost.
@@ -728,6 +777,8 @@ fn describe_catalog(gate: &Gate, routing: &Routing) -> Reply {
             entry["kind"] = json!("static");
         } else if r.proxy.is_some() {
             entry["kind"] = json!("proxy");
+        } else if r.release_store.is_some() {
+            entry["kind"] = json!("release-store");
         } else if r.dashboard {
             entry["kind"] = json!("dashboard");
         }

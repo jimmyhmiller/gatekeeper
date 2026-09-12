@@ -25,3 +25,30 @@ proxy = "127.0.0.1:5557"
 [[route]]
 path = "/api"
 function = "target/release/libhello_fn.so"
+
+# Long-lived functions that own background threads use the structured service
+# form. They stay mapped until Gatekeeper exits and update on process restart.
+# [[route]]
+# path = "/agents"
+# function = { library = "/opt/functions/libcoil_agent_harness.dylib", lifecycle = "service" }
+
+# GitHub Actions OIDC. A matching workflow receives only the listed scopes;
+# unlike the bootstrap token, it cannot enter ordinary private routes.
+# [github_oidc]
+# audience = "https://computer.example.com/coil/releases"
+#
+# [[github_oidc.policy]]
+# name = "coil-nightly"
+# repository_id = "123456789"
+# repository_owner_id = "987654321"
+# ref = "refs/heads/main"
+# workflow_ref = "owner/coil/.github/workflows/nightly.yml@refs/heads/main"
+# environment = "nightly-release"
+# event_names = ["schedule", "workflow_dispatch"]
+# scopes = ["coil:nightly:publish"]
+#
+# The release store is always private. Legacy Gatekeeper credentials can read;
+# only the GitHub OIDC identity carrying publish_scope can create a release.
+# [[route]]
+# path = "/coil/v1"
+# release_store = { root = "/var/lib/gatekeeper/releases/coil", read_scope = "coil:read", publish_scope = "coil:nightly:publish", max_artifact_bytes = 536870912, retain_builds = 14 }

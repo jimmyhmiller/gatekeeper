@@ -13,6 +13,39 @@
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::oidc::{GitHubOidcVerifier, GitHubPrincipal};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Principal {
+    BootstrapToken,
+    DeviceToken,
+    BrowserSession,
+    GitHubActions(GitHubPrincipal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthContext {
+    pub principal: Principal,
+    pub scopes: Vec<String>,
+}
+
+impl AuthContext {
+    fn administrator(principal: Principal) -> Self {
+        Self {
+            principal,
+            scopes: vec!["*".into()],
+        }
+    }
+
+    pub fn allows(&self, required: &[String]) -> bool {
+        self.scopes.iter().any(|s| s == "*")
+            || (!required.is_empty()
+                && required
+                    .iter()
+                    .all(|wanted| self.scopes.iter().any(|s| s == wanted)))
+    }
+}
+
 /// Holds the expected token in a form that compares in constant time.
 #[derive(Clone)]
 pub struct Authenticator {
@@ -112,6 +145,7 @@ fn cookie_value<'a>(value: &'a str, name: &str) -> Option<&'a str> {
 pub struct Verifier {
     token: Option<Authenticator>,
     passkeys: Option<std::sync::Arc<crate::passkey::PasskeyEngine>>,
+    github_oidc: Option<std::sync::Arc<GitHubOidcVerifier>>,
 }
 
 impl Verifier {
@@ -119,14 +153,23 @@ impl Verifier {
         token: Option<Authenticator>,
         passkeys: Option<std::sync::Arc<crate::passkey::PasskeyEngine>>,
     ) -> Self {
-        Verifier { token, passkeys }
+        Verifier {
+            token,
+            passkeys,
+            github_oidc: None,
+        }
+    }
+
+    pub fn with_github_oidc(mut self, oidc: Option<std::sync::Arc<GitHubOidcVerifier>>) -> Self {
+        self.github_oidc = oidc;
+        self
     }
 
     /// True if at least one kind of credential is configured. Boot refuses to
     /// serve a private route when this is false — the fail-closed invariant,
     /// now stated over all credential kinds rather than just the token.
     pub fn is_configured(&self) -> bool {
-        self.token.is_some() || self.passkeys.is_some()
+        self.token.is_some() || self.passkeys.is_some() || self.github_oidc.is_some()
     }
 
     /// True if the shared bootstrap token is configured. The device flow can
@@ -159,33 +202,54 @@ impl Verifier {
     }
 
     pub fn check_headers(&self, headers: &[tiny_http::Header]) -> bool {
+        self.authenticate_headers(headers)
+            .is_some_and(|auth| auth.allows(&[]))
+    }
+
+    pub fn authenticate_headers(&self, headers: &[tiny_http::Header]) -> Option<AuthContext> {
         // Machine path. Bootstrap token or device token; both are bearer.
         if let Some(auth) = header_value(headers, "authorization") {
-            let Some(presented) = bearer(auth) else {
-                return false;
-            };
-            // Deliberately not short-circuiting: check every credential kind so
-            // the response time does not reveal WHICH kind matched, or how many
-            // device tokens exist.
-            return self.verify_bearer(presented);
+            let presented = bearer(auth)?;
+            if self.token.as_ref().is_some_and(|a| a.verify(presented)) {
+                return Some(AuthContext::administrator(Principal::BootstrapToken));
+            }
+            if self
+                .passkeys
+                .as_ref()
+                .is_some_and(|p| p.verify_device_token(presented))
+            {
+                return Some(AuthContext::administrator(Principal::DeviceToken));
+            }
+            if let Some(oidc) = &self.github_oidc {
+                if let Ok((principal, scopes)) = oidc.verify(presented) {
+                    return Some(AuthContext {
+                        principal: Principal::GitHubActions(principal),
+                        scopes,
+                    });
+                }
+            }
+            return None;
         }
         // Browser path. A passkey session, or the bootstrap token as a cookie
         // (kept as break-glass so a lost passkey never locks you out).
         if let Some(cookie) = header_value(headers, "cookie") {
-            let mut ok = false;
             if let Some(p) = &self.passkeys {
                 if let Some(sess) = cookie_value(cookie, "gk_session") {
-                    ok |= p.verify_session(sess);
+                    if p.verify_session(sess) {
+                        return Some(AuthContext::administrator(Principal::BrowserSession));
+                    }
                 }
             }
             if let Some(a) = &self.token {
                 if let Some(tok) = cookie_value(cookie, "gatekeeper") {
-                    ok |= a.verify(tok);
+                    if a.verify(tok) {
+                        return Some(AuthContext::administrator(Principal::BootstrapToken));
+                    }
                 }
             }
-            return ok;
+            return None;
         }
-        false
+        None
     }
 }
 
@@ -308,5 +372,23 @@ mod tests {
         assert!(!v.verify_bootstrap("nope"));
         let none = Verifier::new(None, None);
         assert!(!none.verify_bootstrap("tok"));
+    }
+
+    #[test]
+    fn scoped_identity_cannot_enter_legacy_unscoped_routes() {
+        let ctx = AuthContext {
+            principal: Principal::DeviceToken,
+            scopes: vec!["coil:nightly:publish".into()],
+        };
+        assert!(!ctx.allows(&[]));
+        assert!(ctx.allows(&["coil:nightly:publish".into()]));
+        assert!(!ctx.allows(&["other".into()]));
+    }
+
+    #[test]
+    fn legacy_administrator_keeps_existing_private_access() {
+        let ctx = AuthContext::administrator(Principal::BootstrapToken);
+        assert!(ctx.allows(&[]));
+        assert!(ctx.allows(&["anything".into()]));
     }
 }

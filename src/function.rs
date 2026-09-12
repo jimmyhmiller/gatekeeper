@@ -1,17 +1,18 @@
 //! Serverless function backend: invoke a Rust app compiled as a `cdylib` in
 //! process via `dlopen`, instead of proxying to a long-running upstream.
 //!
-//! A function route points at a dynamic library (`.so`/`.dylib`/`.dll`) built
-//! against `gatekeeper-fn`. The gate loads it once (lazily, on first request),
-//! checks its ABI version, caches the open handle, and on each request marshals
+//! A function route points at a dynamic library (`.so`/`.dylib`/`.dll`) implementing
+//! `gatekeeper-abi`. The gate loads it lazily, checks its ABI version, caches the
+//! open handle, and on each request marshals
 //! the request into the `#[repr(C)]` [`GkRequest`], calls the exported
 //! `gk_handle`, copies the response out, and hands the response pointer back to
 //! the library's `gk_free`.
 //!
 //! ## Why this is safe to share-fate with the gate
 //!
-//! The function side (in `gatekeeper-fn`) catches panics and returns a 500, so a
-//! handler panic does not unwind across the ABI into the gate. The remaining
+//! The Rust SDK catches panics and returns a 500, so a Rust handler panic does
+//! not unwind across the ABI into the gate. Other implementations must likewise
+//! never unwind across the C boundary. The remaining
 //! shared-fate risk is genuine UB inside a function (a function dylib is trusted
 //! native code — it can do anything). That is acceptable here for the same
 //! reason `proxy` upstreams are trusted: you deploy your own functions. We do
@@ -25,11 +26,16 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::{self, Read};
 use std::os::raw::c_char;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use gatekeeper_abi::{GkHeader, GkRequest, GkResponse, GK_ABI_VERSION};
+use gatekeeper_abi::{
+    GkHeader, GkRequest, GkResponse, GK_ABI_VERSION, GK_BODY_BUFFERED, GK_BODY_STREAM,
+    GK_STREAM_FREE_SYMBOL, GK_STREAM_READ_SYMBOL,
+};
 
+use crate::config::{FunctionLifecycle, FunctionTarget};
 use crate::reply::Reply;
 
 /// A loaded function dylib plus its resolved symbols. The `Library` must outlive
@@ -42,10 +48,13 @@ struct LoadedFn {
     // `_lib` last.
     handle: HandleFn,
     free: FreeFn,
+    abi_version: u32,
     /// Required self-description symbol (ABI v2): every function must export
     /// `gk_describe` (via the SDK's `#[describe]`), so the describe catalog is
     /// always complete. Resolved at load time; a missing one fails the load.
     describe: DescribeFn,
+    stream_read: Option<StreamReadFn>,
+    stream_free: Option<StreamFreeFn>,
     _lib: libloading::Library,
     /// Each version is loaded from a UNIQUE private copy of the dylib (see
     /// `load_library`), so the dynamic linker treats a reloaded build as a
@@ -68,9 +77,71 @@ impl Drop for LoadedFn {
 }
 
 type VersionFn = unsafe extern "C" fn() -> u32;
-type DescribeFn = unsafe extern "C" fn() -> *mut GkResponse;
-type HandleFn = unsafe extern "C" fn(*const GkRequest) -> *mut GkResponse;
-type FreeFn = unsafe extern "C" fn(*mut GkResponse);
+type DescribeFn = unsafe extern "C" fn() -> *mut std::ffi::c_void;
+type HandleFn = unsafe extern "C" fn(*const GkRequest) -> *mut std::ffi::c_void;
+type FreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
+type StreamReadFn = unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, usize) -> isize;
+type StreamFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
+
+const GK_ABI_VERSION_V2: u32 = 2;
+
+/// Frozen response layout from ABI v2. Requests and headers did not change in
+/// v3, but responses gained body discrimination and stream state. Keeping the
+/// old layout explicit lets the gate safely serve existing buffered functions.
+#[repr(C)]
+struct GkResponseV2 {
+    status: u16,
+    headers_ptr: *mut GkHeader,
+    header_count: usize,
+    body_ptr: *mut u8,
+    body_len: usize,
+}
+
+struct FunctionStream {
+    state: *mut std::ffi::c_void,
+    _func: Arc<LoadedFn>,
+    read: StreamReadFn,
+    free: StreamFreeFn,
+    done: bool,
+}
+
+unsafe impl Send for FunctionStream {}
+
+impl Read for FunctionStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.done || buf.is_empty() {
+            return Ok(0);
+        }
+        let count = unsafe { (self.read)(self.state, buf.as_mut_ptr(), buf.len()) };
+        if count < 0 {
+            self.done = true;
+            Err(io::Error::other("function stream read failed"))
+        } else {
+            let count = count as usize;
+            if count > buf.len() {
+                self.done = true;
+                Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "function stream returned more bytes than the supplied buffer",
+                ))
+            } else {
+                if count == 0 {
+                    self.done = true;
+                }
+                Ok(count)
+            }
+        }
+    }
+}
+
+impl Drop for FunctionStream {
+    fn drop(&mut self) {
+        if !self.state.is_null() {
+            unsafe { (self.free)(self.state) };
+            self.state = std::ptr::null_mut();
+        }
+    }
+}
 
 // Safe to share across worker threads: after load it is immutable, and the
 // underlying handler is required to be thread-safe (it is pure per-call in the
@@ -110,13 +181,18 @@ struct CacheEntry {
     stamp: FileStamp,
 }
 
-/// Process-wide cache of loaded function dylibs, keyed by library path. Lazily
-/// populated: a function is loaded on its first request and kept resident until
-/// the file on disk changes, at which point it is transparently reloaded — so
-/// shipping a new build of a function (same path) takes effect on the next
-/// request, no restart or reload needed.
+#[derive(Hash, PartialEq, Eq)]
+struct FunctionKey {
+    path: OsString,
+    lifecycle: FunctionLifecycle,
+}
+
+/// Process-wide cache of loaded function dylibs, keyed by path and lifecycle.
+/// Reloadable functions refresh when their file changes. Service functions may
+/// own background execution and are loaded exactly once, then pinned until the
+/// process exits.
 pub struct FunctionRegistry {
-    loaded: Mutex<HashMap<OsString, CacheEntry>>,
+    loaded: Mutex<HashMap<FunctionKey, CacheEntry>>,
 }
 
 impl FunctionRegistry {
@@ -138,11 +214,50 @@ impl FunctionRegistry {
         headers: &[tiny_http::Header],
         body: &[u8],
     ) -> Reply {
-        let func = match self.get_or_load(lib_path) {
+        let func = match self.get_or_load(lib_path, FunctionLifecycle::Reloadable) {
             Ok(f) => f,
-            Err(e) => return Reply::status(502, &format!("Bad Gateway: function load failed: {e}")),
+            Err(e) => {
+                return Reply::status(502, &format!("Bad Gateway: function load failed: {e}"))
+            }
         };
-        call_function(&func, method, path, query, headers, body)
+        call_function(func, method, path, query, headers, body)
+    }
+
+    pub fn invoke_service(
+        &self,
+        lib_path: &std::path::Path,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[tiny_http::Header],
+        body: &[u8],
+    ) -> Reply {
+        let func = match self.get_or_load(lib_path, FunctionLifecycle::Service) {
+            Ok(f) => f,
+            Err(e) => {
+                return Reply::status(502, &format!("Bad Gateway: function load failed: {e}"))
+            }
+        };
+        call_function(func, method, path, query, headers, body)
+    }
+
+    pub fn invoke_target(
+        &self,
+        target: &FunctionTarget,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: &[tiny_http::Header],
+        body: &[u8],
+    ) -> Reply {
+        match target.lifecycle() {
+            FunctionLifecycle::Reloadable => {
+                self.invoke(target.library(), method, path, query, headers, body)
+            }
+            FunctionLifecycle::Service => {
+                self.invoke_service(target.library(), method, path, query, headers, body)
+            }
+        }
     }
 
     /// Ask the function dylib at `lib_path` to describe itself (ABI v2). Loads it
@@ -150,7 +265,15 @@ impl FunctionRegistry {
     /// loaded (which now includes a missing `gk_describe` — it is required).
     /// Used to build the `/describe` catalog.
     pub fn describe(&self, lib_path: &std::path::Path) -> Result<String, String> {
-        let func = self.get_or_load(lib_path)?;
+        self.describe_with_lifecycle(lib_path, FunctionLifecycle::Reloadable)
+    }
+
+    pub fn describe_with_lifecycle(
+        &self,
+        lib_path: &std::path::Path,
+        lifecycle: FunctionLifecycle,
+    ) -> Result<String, String> {
+        let func = self.get_or_load(lib_path, lifecycle)?;
         // SAFETY: func.describe is a valid fn pointer from the loaded library; the
         // function side catches its own panics. It returns an owned GkResponse we
         // copy out and then free via the dylib's own gk_free (same contract as a
@@ -159,8 +282,11 @@ impl FunctionRegistry {
         if resp_ptr.is_null() {
             return Err("gk_describe returned null".into());
         }
-        let reply = unsafe { copy_response(resp_ptr) };
+        let reply = unsafe { copy_response(resp_ptr, Arc::clone(&func)) };
         unsafe { (func.free)(resp_ptr) };
+        if reply.is_stream() {
+            return Err("gk_describe returned a streaming response".to_string());
+        }
         Ok(String::from_utf8_lossy(&reply.body).into_owned())
     }
 
@@ -180,8 +306,36 @@ impl FunctionRegistry {
     fn get_or_load(
         &self,
         lib_path: &std::path::Path,
+        lifecycle: FunctionLifecycle,
     ) -> Result<std::sync::Arc<LoadedFn>, String> {
-        let key = lib_path.as_os_str().to_os_string();
+        let key = FunctionKey {
+            path: lib_path.as_os_str().to_os_string(),
+            lifecycle,
+        };
+
+        // Loading a service image is a once-per-process transition. Hold the
+        // registry lock across its one dlopen so two first requests cannot load
+        // two runtimes and let the losing image become unmapped while its
+        // background threads continue. Reloadable functions deliberately load
+        // off-lock below because their old image is request-scoped.
+        if lifecycle == FunctionLifecycle::Service {
+            let mut map = self.loaded.lock().unwrap();
+            if let Some(entry) = map.get(&key) {
+                return Ok(std::sync::Arc::clone(&entry.func));
+            }
+            let stamp = FileStamp::of(lib_path)
+                .ok_or_else(|| format!("cannot stat service function {}", lib_path.display()))?;
+            let func = std::sync::Arc::new(load_library(lib_path, true)?);
+            map.insert(
+                key,
+                CacheEntry {
+                    func: std::sync::Arc::clone(&func),
+                    stamp,
+                },
+            );
+            return Ok(func);
+        }
+
         let disk = FileStamp::of(lib_path);
 
         // Fast path: cached entry whose stamp still matches the file on disk.
@@ -205,13 +359,19 @@ impl FunctionRegistry {
         // a write-during-load race: if it changes again we'll just reload next
         // time).
         let pre_stamp = FileStamp::of(lib_path);
-        match load_library(lib_path) {
+        match load_library(lib_path, false) {
             Ok(lib) => {
                 let func = std::sync::Arc::new(lib);
                 let stamp = pre_stamp.or(disk);
                 let mut map = self.loaded.lock().unwrap();
                 if let Some(stamp) = stamp {
-                    map.insert(key, CacheEntry { func: std::sync::Arc::clone(&func), stamp });
+                    map.insert(
+                        key,
+                        CacheEntry {
+                            func: std::sync::Arc::clone(&func),
+                            stamp,
+                        },
+                    );
                 } else {
                     // No stamp available at all (file vanished mid-flight); serve
                     // this load but don't cache it under an unknown identity.
@@ -237,6 +397,22 @@ impl FunctionRegistry {
     }
 }
 
+impl Drop for FunctionRegistry {
+    fn drop(&mut self) {
+        // A service function may still have background threads executing code
+        // from its image. Leak one strong reference so ordinary teardown never
+        // calls dlclose; the OS reclaims it when the process exits.
+        if let Ok(map) = self.loaded.get_mut() {
+            for (key, entry) in map.iter() {
+                if key.lifecycle == FunctionLifecycle::Service {
+                    let leaked = std::sync::Arc::clone(&entry.func);
+                    let _ = std::sync::Arc::into_raw(leaked);
+                }
+            }
+        }
+    }
+}
+
 impl Default for FunctionRegistry {
     fn default() -> Self {
         Self::new()
@@ -245,7 +421,7 @@ impl Default for FunctionRegistry {
 
 /// Open a dylib and resolve + version-check its symbols. Fails closed on any
 /// missing symbol or ABI mismatch.
-fn load_library(lib_path: &std::path::Path) -> Result<LoadedFn, String> {
+fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, String> {
     // Two dynamic-linker hazards make a naive `dlopen(lib_path)` wrong for
     // hot-reload, and we defuse both here:
     //
@@ -275,10 +451,7 @@ fn load_library(lib_path: &std::path::Path) -> Result<LoadedFn, String> {
     // (same trust level as a proxy upstream — see module docs).
     let lib = unsafe {
         use libloading::os::unix as ldunix;
-        match ldunix::Library::open(
-            Some(&temp_path),
-            ldunix::RTLD_NOW | ldunix::RTLD_LOCAL,
-        ) {
+        match ldunix::Library::open(Some(&temp_path), ldunix::RTLD_NOW | ldunix::RTLD_LOCAL) {
             Ok(l) => libloading::Library::from(l),
             Err(e) => {
                 let _ = std::fs::remove_file(&temp_path);
@@ -308,10 +481,10 @@ fn load_library(lib_path: &std::path::Path) -> Result<LoadedFn, String> {
         };
 
         let got = unsafe { version() };
-        if got != GK_ABI_VERSION {
+        if got != GK_ABI_VERSION_V2 && got != GK_ABI_VERSION {
             return Err(format!(
-                "ABI version mismatch: dylib reports {got}, gate expects {GK_ABI_VERSION} \
-                 (rebuild the function against this gatekeeper)"
+                "ABI version mismatch: dylib reports {got}, gate supports \
+                 {GK_ABI_VERSION_V2} and {GK_ABI_VERSION}"
             ));
         }
 
@@ -324,13 +497,38 @@ fn load_library(lib_path: &std::path::Path) -> Result<LoadedFn, String> {
                 format!("symbol gk_describe: {e} (every function must have a #[describe])")
             })?
         };
+        let (stream_read, stream_free) = if got == GK_ABI_VERSION {
+            let read: StreamReadFn = unsafe {
+                *lib.get(GK_STREAM_READ_SYMBOL)
+                    .map_err(|e| format!("symbol gk_stream_read: {e}"))?
+            };
+            let free: StreamFreeFn = unsafe {
+                *lib.get(GK_STREAM_FREE_SYMBOL)
+                    .map_err(|e| format!("symbol gk_stream_free: {e}"))?
+            };
+            (Some(read), Some(free))
+        } else {
+            (None, None)
+        };
 
+        if pinned {
+            // An open Unix mapping remains valid after unlink. Pinned images do
+            // not run LoadedFn::drop, so remove their staging file now.
+            let _ = std::fs::remove_file(&temp_path);
+        }
         Ok(LoadedFn {
             handle,
             free,
+            abi_version: got,
             describe,
+            stream_read,
+            stream_free,
             _lib: lib,
-            temp_path: Some(temp_path.clone()),
+            temp_path: if pinned {
+                None
+            } else {
+                Some(temp_path.clone())
+            },
         })
     })();
 
@@ -364,7 +562,7 @@ fn unique_temp_path(lib_path: &std::path::Path) -> std::path::PathBuf {
 /// borrowed buffers (method/path/query/headers/body) live on this stack frame
 /// for the whole duration of the call, satisfying the ABI's borrow contract.
 fn call_function(
-    func: &LoadedFn,
+    func: Arc<LoadedFn>,
     method: &str,
     path: &str,
     query: &str,
@@ -415,7 +613,7 @@ fn call_function(
 
     // Copy the response out of the function-owned memory, then free it. We copy
     // before freeing and never retain any function pointer past gk_free.
-    let reply = unsafe { copy_response(resp_ptr) };
+    let reply = unsafe { copy_response(resp_ptr, Arc::clone(&func)) };
     unsafe { (func.free)(resp_ptr) };
     reply
 }
@@ -425,17 +623,65 @@ fn call_function(
 ///
 /// # Safety
 /// `resp_ptr` must be a non-null pointer returned by the function's `gk_handle`.
-unsafe fn copy_response(resp_ptr: *const GkResponse) -> Reply {
-    let resp = &*resp_ptr;
+unsafe fn copy_response(resp_ptr: *const std::ffi::c_void, func: Arc<LoadedFn>) -> Reply {
+    if func.abi_version == GK_ABI_VERSION_V2 {
+        return copy_response_v2(resp_ptr.cast::<GkResponseV2>());
+    }
 
+    let resp = &*resp_ptr.cast::<GkResponse>();
+
+    let mut reply = match resp.body_kind {
+        GK_BODY_BUFFERED => {
+            let body = if resp.body_ptr.is_null() || resp.body_len == 0 {
+                Vec::new()
+            } else {
+                std::slice::from_raw_parts(resp.body_ptr, resp.body_len).to_vec()
+            };
+            Reply::new(resp.status, body)
+        }
+        GK_BODY_STREAM if !resp.stream_ptr.is_null() => Reply::stream(
+            resp.status,
+            Box::new(FunctionStream {
+                state: resp.stream_ptr,
+                read: func
+                    .stream_read
+                    .expect("ABI v3 libraries are loaded with gk_stream_read"),
+                free: func
+                    .stream_free
+                    .expect("ABI v3 libraries are loaded with gk_stream_free"),
+                _func: func,
+                done: false,
+            }),
+        ),
+        GK_BODY_STREAM => Reply::status(500, "function returned a null stream"),
+        _ => Reply::status(500, "function returned an unknown body kind"),
+    };
+
+    if !resp.headers_ptr.is_null() {
+        let hdrs = std::slice::from_raw_parts(resp.headers_ptr, resp.header_count);
+        for h in hdrs {
+            let name = bytes_to_string(h.name_ptr, h.name_len);
+            let value = bytes_to_string(h.value_ptr, h.value_len);
+            if !name.is_empty() {
+                reply = reply.with_header(&name, &value);
+            }
+        }
+    }
+    reply
+}
+
+/// Copy the frozen buffered response layout used by ABI v2.
+///
+/// # Safety
+/// `resp_ptr` must point to a non-null response returned by an ABI v2 function.
+unsafe fn copy_response_v2(resp_ptr: *const GkResponseV2) -> Reply {
+    let resp = &*resp_ptr;
     let body = if resp.body_ptr.is_null() || resp.body_len == 0 {
         Vec::new()
     } else {
         std::slice::from_raw_parts(resp.body_ptr, resp.body_len).to_vec()
     };
-
     let mut reply = Reply::new(resp.status, body);
-
     if !resp.headers_ptr.is_null() {
         let hdrs = std::slice::from_raw_parts(resp.headers_ptr, resp.header_count);
         for h in hdrs {

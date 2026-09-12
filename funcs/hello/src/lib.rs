@@ -16,6 +16,12 @@ fn app(req: Request) -> Response {
             req.query(),
             req.text().replace('"', "\\\"")
         )),
+        "/sse" => Response::stream(
+            200,
+            std::io::Cursor::new(b"event: greeting\ndata: hello\n\n".to_vec()),
+        )
+        .header("Content-Type", "text/event-stream")
+        .header("Cache-Control", "no-cache"),
         "/panic" => panic!("deliberate panic to prove the gate survives it"),
         p => Response::html(format!(
             "<h1>hello from a gatekeeper function</h1><p>you asked for <code>{p}</code></p>"
@@ -34,6 +40,7 @@ fn describe() -> Description {
                 .returns("{ method, query, body }"),
         )
         .endpoint(Endpoint::get("/panic", "deliberately panics (proves the gate survives it)"))
+        .endpoint(Endpoint::get("/sse", "stream an event using the native streaming ABI"))
         .endpoint(
             Endpoint::get("/<anything>", "greets you with the path")
                 .param(Param::new("(none)", "n/a", "no params"))

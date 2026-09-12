@@ -22,6 +22,16 @@ fn target_dir() -> PathBuf {
         .join(if cfg!(debug_assertions) { "debug" } else { "release" })
 }
 
+fn dylib_name(stem: &str) -> String {
+    if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
 fn require(p: &Path) -> PathBuf {
     assert!(
         p.exists(),
@@ -41,8 +51,8 @@ fn deploy(src: &Path, dst: &Path) {
 
 #[test]
 fn rebuilt_dylib_is_picked_up_without_restart() {
-    let hello = require(&target_dir().join("libhello_fn.so"));
-    let analytics = require(&target_dir().join("libanalytics_fn.so"));
+    let hello = require(&target_dir().join(dylib_name("hello_fn")));
+    let analytics = require(&target_dir().join(dylib_name("analytics_fn")));
 
     // A unique per-test path under the target dir (avoids cross-test races).
     let live = target_dir().join("libhotswap_test.so");
@@ -112,7 +122,7 @@ fn rebuilt_dylib_is_picked_up_without_restart() {
 fn unchanged_dylib_is_served_from_cache() {
     // Sanity: repeated invokes of an unchanged file must keep working (the fast
     // path) — the stat-per-call must not break the warm cache.
-    let hello = require(&target_dir().join("libhello_fn.so"));
+    let hello = require(&target_dir().join(dylib_name("hello_fn")));
     let live = target_dir().join("libhotswap_cache_test.so");
     let _ = std::fs::remove_file(&live);
     deploy(&hello, &live);
@@ -122,5 +132,52 @@ fn unchanged_dylib_is_served_from_cache() {
         let r = reg.invoke(&live, "GET", "/x", "", &[], b"");
         assert_eq!(r.status, 200);
     }
+    let _ = std::fs::remove_file(&live);
+}
+
+#[test]
+fn service_dylib_is_pinned_when_the_file_changes() {
+    let hello = require(&target_dir().join(dylib_name("hello_fn")));
+    let analytics = require(&target_dir().join(dylib_name("analytics_fn")));
+    let live = target_dir().join("libservice_pin_test.so");
+    let _ = std::fs::remove_file(&live);
+    deploy(&hello, &live);
+
+    let reg = std::sync::Arc::new(FunctionRegistry::new());
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let mut threads = Vec::new();
+    for _ in 0..8 {
+        let reg = std::sync::Arc::clone(&reg);
+        let barrier = std::sync::Arc::clone(&barrier);
+        let live = live.clone();
+        threads.push(std::thread::spawn(move || {
+            barrier.wait();
+            reg.invoke_service(
+                &live,
+                "GET",
+                "/hello",
+                "",
+                &[],
+                b"",
+            )
+        }));
+    }
+    for thread in threads {
+        let response = thread.join().unwrap();
+        assert_eq!(response.status, 200);
+    }
+
+    deploy(&analytics, &live);
+    let r2 = reg.invoke_service(
+        &live,
+        "GET",
+        "/hello",
+        "",
+        &[],
+        b"",
+    );
+    assert_eq!(r2.status, 200, "service functions must not hot-reload");
+    assert!(String::from_utf8_lossy(&r2.body).contains("hello from a gatekeeper function"));
+
     let _ = std::fs::remove_file(&live);
 }

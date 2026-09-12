@@ -116,6 +116,20 @@ pub unsafe extern "C" fn gk_handle(
 pub unsafe extern "C" fn gk_free(resp: *mut ::gatekeeper_fn::__rt::GkResponse) {
     ::gatekeeper_fn::__rt::free(resp)
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn gk_stream_read(
+    stream: *mut ::std::ffi::c_void,
+    output: *mut u8,
+    capacity: usize,
+) -> isize {
+    ::gatekeeper_fn::__rt::stream_read(stream, output, capacity)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn gk_stream_free(stream: *mut ::std::ffi::c_void) {
+    ::gatekeeper_fn::__rt::stream_free(stream)
+}
 "#;
 
 /// Glue for `#[describe]`: emit `gk_describe`, forwarding to the user's function
