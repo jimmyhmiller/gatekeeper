@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use gatekeeper::auth::{Authenticator, Verifier};
+use gatekeeper::oidc::GitHubOidcVerifier;
 use gatekeeper::config::{self, Config, Target};
 use gatekeeper::function::FunctionRegistry;
 use gatekeeper::login;
@@ -233,7 +234,12 @@ fn build_routing(
 ) -> Routing {
     Routing {
         router: Router::new(cfg.route.clone()),
-        verifier: Verifier::new(token.map(Authenticator::new), passkeys),
+        verifier: Verifier::new(token.map(Authenticator::new), passkeys).with_github_oidc(
+            cfg.github_oidc
+                .clone()
+                .map(GitHubOidcVerifier::new)
+                .map(Arc::new),
+        ),
         unmatched_status: cfg.unmatched_status,
         tls: cfg.tls_enabled(),
         jobs: cfg.job.clone(),
@@ -474,8 +480,8 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
         Match::Route { route, rest, .. } => {
             // The safety gate: private routes require a valid token.
             if !route.public {
-                let ok = routing.verifier.check_headers(request.headers());
-                if !ok {
+                let auth = routing.verifier.authenticate_headers(request.headers());
+                if !auth.as_ref().is_some_and(|a| a.allows(&route.scopes)) {
                     let r = Reply::status(401, "Unauthorized")
                         .with_header("WWW-Authenticate", "Bearer");
                     let _ = r.respond(request);

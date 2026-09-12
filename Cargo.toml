@@ -38,6 +38,8 @@ uuid = { version = "1", features = ["v4", "serde"] }
 base64 = "0.22"
 hmac = "0.12"
 sha2 = "0.10"
+jsonwebtoken = "9"
+ureq = { version = "2.12", features = ["json"] }
 
 [dev-dependencies]
 proptest = "1.11.0"

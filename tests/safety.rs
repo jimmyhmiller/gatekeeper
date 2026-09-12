@@ -18,6 +18,7 @@ fn route(path: &str, public: bool) -> Route {
         proxy: None,
         function: None,
         public,
+        scopes: Vec::new(),
     }
 }
 

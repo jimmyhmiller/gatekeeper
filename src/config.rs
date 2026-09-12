@@ -44,6 +44,49 @@ pub struct Config {
     /// the safe state is the default and the capable state is opt-in.
     #[serde(default)]
     pub passkey: Option<PasskeyConfig>,
+    /// GitHub Actions OIDC trust policy. Absent means GitHub JWTs are never
+    /// accepted as credentials.
+    #[serde(default)]
+    pub github_oidc: Option<GitHubOidcConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubOidcConfig {
+    /// Exact audience requested by the workflow and required by Gatekeeper.
+    pub audience: String,
+    /// GitHub's issuer. Configurable for tests/GHES, but validated as HTTPS.
+    #[serde(default = "default_github_oidc_issuer")]
+    pub issuer: String,
+    /// Discovery URL. Defaults to `<issuer>/.well-known/openid-configuration`.
+    #[serde(default)]
+    pub discovery_url: Option<String>,
+    /// How long a successfully fetched discovery/JWKS document may be reused.
+    #[serde(default = "default_oidc_cache_ttl")]
+    pub cache_ttl_secs: u64,
+    #[serde(default)]
+    pub policy: Vec<GitHubOidcPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct GitHubOidcPolicy {
+    pub name: String,
+    pub repository_id: String,
+    pub repository_owner_id: String,
+    pub r#ref: String,
+    pub workflow_ref: String,
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub event_names: Vec<String>,
+    pub scopes: Vec<String>,
+}
+
+fn default_github_oidc_issuer() -> String {
+    "https://token.actions.githubusercontent.com".into()
+}
+
+fn default_oidc_cache_ttl() -> u64 {
+    3600
 }
 
 /// One scheduled job: a command run on a fixed interval by the gate's scheduler
@@ -148,6 +191,10 @@ pub struct Route {
     /// Public routes skip auth. **Defaults to false** — fail safe.
     #[serde(default)]
     pub public: bool,
+    /// Scopes required after authentication. Empty preserves the historical
+    /// rule: any configured credential may access this private route.
+    #[serde(default)]
+    pub scopes: Vec<String>,
 }
 
 /// A function route may use the original path shorthand or an explicit target.
@@ -384,6 +431,41 @@ impl Config {
             }
         }
 
+        if let Some(oidc) = &self.github_oidc {
+            validate_https_url("github_oidc.issuer", &oidc.issuer)?;
+            if let Some(url) = &oidc.discovery_url {
+                validate_https_url("github_oidc.discovery_url", url)?;
+            }
+            if oidc.audience.trim().is_empty() {
+                return Err(ConfigError("github_oidc.audience must not be empty".into()));
+            }
+            if oidc.cache_ttl_secs == 0 {
+                return Err(ConfigError("github_oidc.cache_ttl_secs must be > 0".into()));
+            }
+            if oidc.policy.is_empty() {
+                return Err(ConfigError("github_oidc requires at least one policy".into()));
+            }
+            let mut names = std::collections::BTreeSet::new();
+            for p in &oidc.policy {
+                if !names.insert(p.name.as_str()) {
+                    return Err(ConfigError(format!("duplicate github_oidc policy {:?}", p.name)));
+                }
+                if p.name.trim().is_empty()
+                    || p.repository_id.trim().is_empty()
+                    || p.repository_owner_id.trim().is_empty()
+                    || p.r#ref.trim().is_empty()
+                    || p.workflow_ref.trim().is_empty()
+                    || p.scopes.is_empty()
+                    || p.scopes.iter().any(|s| s.trim().is_empty())
+                {
+                    return Err(ConfigError(format!(
+                        "github_oidc policy {:?} has an empty required field or scope",
+                        p.name
+                    )));
+                }
+            }
+        }
+
         // Validate jobs: non-empty name + command, a parseable interval, and no
         // duplicate names (so logs are unambiguous).
         let mut job_names: Vec<&str> = Vec::with_capacity(self.job.len());
@@ -417,6 +499,17 @@ impl Config {
     pub fn tls_enabled(&self) -> bool {
         self.tls_cert.is_some() && self.tls_key.is_some()
     }
+}
+
+fn validate_https_url(field: &str, raw: &str) -> Result<(), ConfigError> {
+    let url = url::Url::parse(raw)
+        .map_err(|e| ConfigError(format!("{field} is not a URL: {e}")))?;
+    if url.scheme() != "https" || url.host_str().is_none() || url.username() != "" {
+        return Err(ConfigError(format!(
+            "{field} must be an https URL without userinfo"
+        )));
+    }
+    Ok(())
 }
 
 /// Split an origin into (scheme, host) without pulling `url` into config
@@ -560,5 +653,49 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("conflicting lifecycles"));
+    }
+
+    #[test]
+    fn github_oidc_policy_and_scoped_route_parse() {
+        let cfg = Config::from_toml(
+            r#"
+            [github_oidc]
+            audience = "https://computer.example/coil/releases"
+
+            [[github_oidc.policy]]
+            name = "coil-nightly"
+            repository_id = "123"
+            repository_owner_id = "456"
+            ref = "refs/heads/main"
+            workflow_ref = "jimmyhmiller/coil/.github/workflows/nightly.yml@refs/heads/main"
+            environment = "nightly-release"
+            event_names = ["schedule", "workflow_dispatch"]
+            scopes = ["coil:nightly:publish"]
+
+            [[route]]
+            path = "/coil"
+            static = "/tmp"
+            scopes = ["coil:read"]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.route[0].scopes, ["coil:read"]);
+        assert_eq!(cfg.github_oidc.unwrap().policy[0].repository_id, "123");
+    }
+
+    #[test]
+    fn oidc_without_policy_fails_closed() {
+        let err = Config::from_toml(
+            r#"
+            [github_oidc]
+            audience = "https://computer.example/coil/releases"
+
+            [[route]]
+            path = "/coil"
+            static = "/tmp"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("at least one policy"));
     }
 }

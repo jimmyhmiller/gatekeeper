@@ -2,6 +2,7 @@
 //! integration tests exercise. See `main.rs` for the runnable server.
 
 pub mod auth;
+pub mod oidc;
 pub mod config;
 pub mod function;
 pub mod login;

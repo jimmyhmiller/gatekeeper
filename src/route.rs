@@ -262,6 +262,7 @@ mod tests {
             proxy: None,
             function: None,
             public,
+            scopes: Vec::new(),
         }
     }
 }
