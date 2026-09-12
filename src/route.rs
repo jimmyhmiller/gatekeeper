@@ -261,6 +261,7 @@ mod tests {
             dashboard: false,
             proxy: None,
             function: None,
+            release_store: None,
             public,
             scopes: Vec::new(),
         }

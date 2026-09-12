@@ -8,6 +8,7 @@ pub struct Reply {
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     stream: Option<Box<dyn Read + Send>>,
+    length: Option<usize>,
 }
 
 impl Reply {
@@ -17,6 +18,7 @@ impl Reply {
             headers: Vec::new(),
             body,
             stream: None,
+            length: None,
         }
     }
 
@@ -36,6 +38,17 @@ impl Reply {
             headers: Vec::new(),
             body: Vec::new(),
             stream: Some(body),
+            length: None,
+        }
+    }
+
+    pub fn stream_len(status: u16, body: Box<dyn Read + Send>, length: usize) -> Self {
+        Reply {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+            stream: Some(body),
+            length: Some(length),
         }
     }
 
@@ -50,14 +63,14 @@ impl Reply {
                 tiny_http::StatusCode(self.status),
                 Vec::new(),
                 Box::new(std::io::Cursor::new(self.body)) as Box<dyn Read + Send>,
-                None,
+                self.length,
                 None,
             ),
             Some(body) => tiny_http::Response::new(
                 tiny_http::StatusCode(self.status),
                 Vec::new(),
                 body,
-                None,
+                self.length,
                 None,
             ),
         };

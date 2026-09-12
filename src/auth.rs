@@ -202,7 +202,8 @@ impl Verifier {
     }
 
     pub fn check_headers(&self, headers: &[tiny_http::Header]) -> bool {
-        self.authenticate_headers(headers).is_some()
+        self.authenticate_headers(headers)
+            .is_some_and(|auth| auth.allows(&[]))
     }
 
     pub fn authenticate_headers(&self, headers: &[tiny_http::Header]) -> Option<AuthContext> {

@@ -179,6 +179,10 @@ pub struct Route {
     /// Mutually exclusive with `static` and `proxy`.
     #[serde(default)]
     pub function: Option<FunctionTarget>,
+    /// Transactional, private release storage. Unlike `static`, this streams
+    /// large uploads/downloads and owns publication semantics.
+    #[serde(default)]
+    pub release_store: Option<ReleaseStoreConfig>,
     /// Serve the built-in dashboard: a human-readable index of everything this
     /// gate exposes. Mutually exclusive with the other target kinds.
     ///
@@ -244,18 +248,52 @@ pub enum Target {
     Static(PathBuf),
     Proxy(String),
     Function(FunctionTarget),
+    ReleaseStore(ReleaseStoreConfig),
     Dashboard,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ReleaseStoreConfig {
+    pub root: PathBuf,
+    #[serde(default = "default_release_read_scope")]
+    pub read_scope: String,
+    #[serde(default = "default_release_publish_scope")]
+    pub publish_scope: String,
+    #[serde(default = "default_max_artifact_bytes")]
+    pub max_artifact_bytes: u64,
+    #[serde(default = "default_release_retention")]
+    pub retain_builds: usize,
+}
+
+fn default_release_read_scope() -> String {
+    "coil:read".into()
+}
+fn default_release_publish_scope() -> String {
+    "coil:nightly:publish".into()
+}
+fn default_max_artifact_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+fn default_release_retention() -> usize {
+    14
 }
 
 impl Route {
     /// The validated target. Exactly one of `static`/`proxy`/`function` must be
     /// set; this is enforced by [`Config::validate`], so here we assume it holds.
     pub fn target(&self) -> Target {
-        match (&self.static_dir, &self.proxy, &self.function, self.dashboard) {
-            (Some(dir), None, None, false) => Target::Static(dir.clone()),
-            (None, Some(up), None, false) => Target::Proxy(up.clone()),
-            (None, None, Some(lib), false) => Target::Function(lib.clone()),
-            (None, None, None, true) => Target::Dashboard,
+        match (
+            &self.static_dir,
+            &self.proxy,
+            &self.function,
+            &self.release_store,
+            self.dashboard,
+        ) {
+            (Some(dir), None, None, None, false) => Target::Static(dir.clone()),
+            (None, Some(up), None, None, false) => Target::Proxy(up.clone()),
+            (None, None, Some(lib), None, false) => Target::Function(lib.clone()),
+            (None, None, None, Some(store), false) => Target::ReleaseStore(store.clone()),
+            (None, None, None, None, true) => Target::Dashboard,
             // validate() rejects every other combination before we get here.
             _ => unreachable!("route target validated at load time"),
         }
@@ -338,6 +376,7 @@ impl Config {
                 r.static_dir.is_some(),
                 r.proxy.is_some(),
                 r.function.is_some(),
+                r.release_store.is_some(),
                 r.dashboard,
             ]
             .iter()
@@ -346,14 +385,33 @@ impl Config {
             match set {
                 0 => {
                     return Err(ConfigError(format!(
-                        "route {:?} sets none of 'static', 'proxy', 'function', 'dashboard' — pick one",
+                        "route {:?} sets no target — pick static, proxy, function, release_store, or dashboard",
                         r.path
                     )));
                 }
                 1 => {}
                 _ => {
                     return Err(ConfigError(format!(
-                        "route {:?} sets more than one of 'static'/'proxy'/'function'/'dashboard' — pick one",
+                        "route {:?} sets more than one target — pick exactly one",
+                        r.path
+                    )));
+                }
+            }
+            if let Some(store) = &r.release_store {
+                if r.public {
+                    return Err(ConfigError(format!(
+                        "release_store route {:?} must remain private",
+                        r.path
+                    )));
+                }
+                if store.root.as_os_str().is_empty()
+                    || store.read_scope.trim().is_empty()
+                    || store.publish_scope.trim().is_empty()
+                    || store.max_artifact_bytes == 0
+                    || store.retain_builds < 2
+                {
+                    return Err(ConfigError(format!(
+                        "release_store route {:?} has invalid root/scopes/limits",
                         r.path
                     )));
                 }
@@ -697,5 +755,31 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.0.contains("at least one policy"));
+    }
+
+    #[test]
+    fn private_release_store_parses_and_public_one_is_rejected() {
+        let cfg = Config::from_toml(
+            r#"
+            [[route]]
+            path = "/coil/v1"
+            release_store = { root = "/tmp/releases" }
+            "#,
+        )
+        .unwrap();
+        let store = cfg.route[0].release_store.as_ref().unwrap();
+        assert_eq!(store.read_scope, "coil:read");
+        assert_eq!(store.retain_builds, 14);
+
+        let err = Config::from_toml(
+            r#"
+            [[route]]
+            path = "/coil/v1"
+            release_store = { root = "/tmp/releases" }
+            public = true
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.0.contains("must remain private"));
     }
 }

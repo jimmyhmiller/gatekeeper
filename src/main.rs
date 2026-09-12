@@ -20,6 +20,7 @@ use gatekeeper::passkey::PasskeyEngine;
 use gatekeeper::proxy;
 use gatekeeper::ratelimit::RateLimiter;
 use gatekeeper::reply::Reply;
+use gatekeeper::release_store::ReleaseStore;
 use gatekeeper::route::{Match, Router};
 use gatekeeper::schedule::Scheduler;
 use gatekeeper::serve;
@@ -478,17 +479,26 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
         Match::BadPath => Reply::status(400, "Bad Request"),
         Match::NoRoute => Reply::status(routing.unmatched_status, "Not Found"),
         Match::Route { route, rest, .. } => {
+            let target = route.target();
+            let auth = if route.public {
+                None
+            } else {
+                routing.verifier.authenticate_headers(request.headers())
+            };
             // The safety gate: private routes require a valid token.
             if !route.public {
-                let auth = routing.verifier.authenticate_headers(request.headers());
-                if !auth.as_ref().is_some_and(|a| a.allows(&route.scopes)) {
+                let route_scopes_apply = !matches!(target, Target::ReleaseStore(_));
+                if auth.is_none()
+                    || (route_scopes_apply
+                        && !auth.as_ref().is_some_and(|a| a.allows(&route.scopes)))
+                {
                     let r = Reply::status(401, "Unauthorized")
                         .with_header("WWW-Authenticate", "Bearer");
                     let _ = r.respond(request);
                     return;
                 }
             }
-            match route.target() {
+            match target {
                 // A static shell. Everything it displays comes from /describe,
                 // which is private, so this is safe to serve to anyone: signed
                 // out, the page shows a sign-in prompt and nothing else.
@@ -536,6 +546,25 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                         &body,
                     )
                 }
+                Target::ReleaseStore(config) => match ReleaseStore::new(config) {
+                    Err(error) => {
+                        eprintln!("gatekeeper: release store initialization failed: {error}");
+                        Reply::status(500, "release store failure")
+                    }
+                    Ok(store) => {
+                        let method = request.method().as_str().to_string();
+                        let headers = request.headers().to_vec();
+                        let length = request.body_length();
+                        store.handle(
+                            auth.as_ref().expect("release stores are private"),
+                            &method,
+                            &rest,
+                            &headers,
+                            length,
+                            request.as_reader(),
+                        )
+                    }
+                },
             }
         }
     };
@@ -638,16 +667,17 @@ fn print_exposure_report(
 }
 
 fn target_desc(r: &config::Route) -> String {
-    match (&r.static_dir, &r.proxy, &r.function) {
-        (Some(d), _, _) => format!("static {}", d.display()),
-        (_, Some(u), _) => format!("proxy {u}"),
-        (_, _, Some(function)) => {
+    match (&r.static_dir, &r.proxy, &r.function, &r.release_store) {
+        (Some(d), _, _, _) => format!("static {}", d.display()),
+        (_, Some(u), _, _) => format!("proxy {u}"),
+        (_, _, Some(function), _) => {
             let lifecycle = match function.lifecycle() {
                 config::FunctionLifecycle::Reloadable => "reloadable",
                 config::FunctionLifecycle::Service => "service",
             };
             format!("function {} ({lifecycle})", function.library().display())
         }
+        (_, _, _, Some(store)) => format!("release store {}", store.root.display()),
         _ if r.dashboard => "dashboard (built-in index)".into(),
         _ => "(invalid)".into(),
     }
@@ -700,6 +730,8 @@ fn describe_catalog(gate: &Gate, routing: &Routing) -> Reply {
             entry["kind"] = json!("static");
         } else if r.proxy.is_some() {
             entry["kind"] = json!("proxy");
+        } else if r.release_store.is_some() {
+            entry["kind"] = json!("release-store");
         } else if r.dashboard {
             entry["kind"] = json!("dashboard");
         }
