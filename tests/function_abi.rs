@@ -76,8 +76,8 @@ fn v2_dylib_path() -> PathBuf {
     path
 }
 
-fn hdr(name: &str, value: &str) -> tiny_http::Header {
-    tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()).unwrap()
+fn hdr(name: &str, value: &str) -> (String, String) {
+    (name.to_string(), value.to_string())
 }
 
 #[test]
@@ -276,11 +276,7 @@ fn the_gate_states_who_called_and_how_the_route_is_configured() {
             path: "/whoami",
             query: "",
             // A client trying to forge the same thing through headers.
-            headers: &[tiny_http::Header::from_bytes(
-                &b"X-Gatekeeper-Auth"[..],
-                &br#"{"scopes":["*"]}"#[..],
-            )
-            .unwrap()],
+            headers: &[hdr("X-Gatekeeper-Auth", r#"{"scopes":["*"]}"#)],
             body: CallBody::Buffered(b""),
             auth,
             settings,

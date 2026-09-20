@@ -219,9 +219,10 @@ function = { library = "/opt/functions/libstore.so", stream_request = true }
 ```
 
 Without it, a route that accepts uploads had to buffer every byte in the gate.
-That single limitation is why this repository's release store spent its first
-weeks as a native route target compiled into the gate rather than a function;
-it is now `funcs/coil-release`, and the gate knows nothing about it.
+That single limitation is why a private release store spent its first weeks as a
+native route target compiled into this gate rather than written as a function.
+It now lives in [gatekeeper-functions](https://github.com/jimmyhmiller/gatekeeper-functions)
+with the other applications, and the gate knows nothing about any of them.
 
 v4 also hands a function two things it previously had to infer from headers:
 
@@ -280,6 +281,12 @@ named its scope.
 
 `funcs/hello` is a complete worked example. After `cargo build -p hello-fn`, run
 the gate with a route pointing at `target/debug/libhello_fn.so` and `curl` it.
+`funcs/nodescribe` and `funcs/v2-compat` are test fixtures, not examples.
+
+Those three are the only functions here. Real applications live in
+[gatekeeper-functions](https://github.com/jimmyhmiller/gatekeeper-functions),
+which depends on `gatekeeper-fn` from this repository — a generic front door
+should not ship anybody's analytics.
 
 ### Adding functions live (no restart)
 
@@ -314,7 +321,7 @@ curl -H "Authorization: Bearer $GATEKEEPER_TOKEN" https://host/describe
 
 ```json
 {
-  "gatekeeper": { "describe_path": "/describe", "abi_version": 2 },
+  "gatekeeper": { "describe_path": "/describe", "abi_version": 4 },
   "routes": [
     { "path": "/analytics", "access": "private", "kind": "function",
       "description": {

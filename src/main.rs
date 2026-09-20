@@ -598,7 +598,11 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                     let method = request.method().as_str().to_string();
                     let auth_json = auth.as_ref().map(|a| a.to_json()).unwrap_or_default();
                     let settings = function.settings_json();
-                    let headers = request.headers().to_vec();
+                    let headers: Vec<(String, String)> = request
+                        .headers()
+                        .iter()
+                        .map(|h| (h.field.as_str().as_str().to_string(), h.value.as_str().to_string()))
+                        .collect();
                     if function.stream_request() {
                         let total = request.body_length().map(|n| n as u64).unwrap_or(u64::MAX);
                         gate.functions.invoke_target(

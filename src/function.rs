@@ -102,7 +102,10 @@ pub struct Call<'a> {
     pub path: &'a str,
     /// Raw query string, without the leading `?`.
     pub query: &'a str,
-    pub headers: &'a [tiny_http::Header],
+    /// Header name/value pairs. Deliberately not the HTTP crate's own type:
+    /// that is a vendored fork, and putting it in this signature would make it
+    /// part of the public API of every caller, including out-of-tree functions.
+    pub headers: &'a [(String, String)],
     pub body: CallBody<'a>,
     /// The gate's view of the caller, as JSON. Empty on a public route.
     pub auth: &'a str,
@@ -117,7 +120,7 @@ impl<'a> Call<'a> {
         method: &'a str,
         path: &'a str,
         query: &'a str,
-        headers: &'a [tiny_http::Header],
+        headers: &'a [(String, String)],
         body: &'a [u8],
     ) -> Self {
         Call {
@@ -632,22 +635,13 @@ fn call_function(func: Arc<LoadedFn>, call: Call<'_>) -> Reply {
     // Stage header name/value bytes into owned buffers we control, then build
     // the GkHeader array pointing into them. Both buffers and the array outlive
     // the call.
-    let header_bytes: Vec<(Vec<u8>, Vec<u8>)> = headers
+    let gk_headers: Vec<GkHeader> = headers
         .iter()
-        .map(|h| {
-            (
-                h.field.as_str().as_str().as_bytes().to_vec(),
-                h.value.as_str().as_bytes().to_vec(),
-            )
-        })
-        .collect();
-    let gk_headers: Vec<GkHeader> = header_bytes
-        .iter()
-        .map(|(n, v)| GkHeader {
-            name_ptr: n.as_ptr() as *const c_char,
-            name_len: n.len(),
-            value_ptr: v.as_ptr() as *const c_char,
-            value_len: v.len(),
+        .map(|(name, value)| GkHeader {
+            name_ptr: name.as_ptr() as *const c_char,
+            name_len: name.len(),
+            value_ptr: value.as_ptr() as *const c_char,
+            value_len: value.len(),
         })
         .collect();
 

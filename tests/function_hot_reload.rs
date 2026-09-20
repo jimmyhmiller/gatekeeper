@@ -35,7 +35,7 @@ fn dylib_name(stem: &str) -> String {
 fn require(p: &Path) -> PathBuf {
     assert!(
         p.exists(),
-        "missing {} — run `cargo build -p hello-fn -p analytics-fn` first",
+        "missing {} — run `cargo build -p hello-fn` first",
         p.display()
     );
     p.to_path_buf()

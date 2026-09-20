@@ -1,13 +1,9 @@
 [workspace]
 members = [
-    "crates/datalog-client",
     "crates/gatekeeper-abi",
     "crates/gatekeeper-fn",
     "crates/gatekeeper-fn-macro",
     "funcs/hello",
-    "funcs/analytics",
-    "funcs/coil-release",
-    "funcs/polls",
     "funcs/nodescribe",
     "funcs/v2-compat",
 ]
