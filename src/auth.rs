@@ -44,6 +44,51 @@ impl AuthContext {
                     .iter()
                     .all(|wanted| self.scopes.iter().any(|s| s == wanted)))
     }
+
+    /// Whether the caller holds at least one of `options`.
+    ///
+    /// The counterpart to [`AuthContext::allows`], for a route that admits more
+    /// than one kind of caller and lets what is behind it draw the finer line.
+    /// An empty list admits nobody, matching `allows`: fail closed.
+    pub fn allows_any(&self, options: &[String]) -> bool {
+        self.scopes.iter().any(|s| s == "*")
+            || options
+                .iter()
+                .any(|wanted| self.scopes.iter().any(|s| s == wanted))
+    }
+
+    /// The gate's own view of this caller, as JSON, for handing to a function.
+    ///
+    /// A function cannot verify a credential itself, and a header could be set
+    /// by the client, so the gate states what it verified. `claims` carries the
+    /// identity the credential proved; for a GitHub Actions token that is the
+    /// workflow and run the request came from, which is what lets a function
+    /// bind a multi-request transaction to one run.
+    pub fn to_json(&self) -> String {
+        let (kind, claims) = match &self.principal {
+            Principal::BootstrapToken => ("bootstrap", serde_json::Value::Null),
+            Principal::DeviceToken => ("device", serde_json::Value::Null),
+            Principal::BrowserSession => ("browser", serde_json::Value::Null),
+            Principal::GitHubActions(p) => (
+                "github-actions",
+                serde_json::json!({
+                    "policy": p.policy,
+                    "repository_id": p.repository_id,
+                    "repository_owner_id": p.repository_owner_id,
+                    "workflow_ref": p.workflow_ref,
+                    "run_id": p.run_id,
+                    "run_attempt": p.run_attempt,
+                    "commit": p.commit,
+                }),
+            ),
+        };
+        serde_json::json!({
+            "principal": kind,
+            "scopes": self.scopes,
+            "claims": claims,
+        })
+        .to_string()
+    }
 }
 
 /// Holds the expected token in a form that compares in constant time.
@@ -378,10 +423,10 @@ mod tests {
     fn scoped_identity_cannot_enter_legacy_unscoped_routes() {
         let ctx = AuthContext {
             principal: Principal::DeviceToken,
-            scopes: vec!["coil:nightly:publish".into()],
+            scopes: vec!["releases:publish".into()],
         };
         assert!(!ctx.allows(&[]));
-        assert!(ctx.allows(&["coil:nightly:publish".into()]));
+        assert!(ctx.allows(&["releases:publish".into()]));
         assert!(!ctx.allows(&["other".into()]));
     }
 

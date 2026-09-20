@@ -7,8 +7,33 @@
 use gatekeeper_fn::{describe, handler, Description, Endpoint, Param, Request, Response};
 
 #[handler]
-fn app(req: Request) -> Response {
+fn app(mut req: Request) -> Response {
     match req.path() {
+        // Prove a body can cross the ABI without the gate holding it: count the
+        // bytes as they arrive and never keep more than one chunk.
+        "/drain" => {
+            let mut total = 0u64;
+            let mut chunk = [0u8; 8 * 1024];
+            let mut reader = req.reader();
+            loop {
+                match std::io::Read::read(&mut reader, &mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => total += n as u64,
+                    Err(e) => return Response::status(500, format!("read failed: {e}")),
+                }
+            }
+            Response::json(format!(
+                r#"{{"bytes":{total},"streamed":{}}}"#,
+                req.is_streaming()
+            ))
+        }
+        // Echo back what the gate said about the caller and the route, so a test
+        // can prove neither is something the client could have forged.
+        "/whoami" => Response::json(format!(
+            r#"{{"auth":{},"settings":{}}}"#,
+            if req.auth().is_empty() { "null" } else { req.auth() },
+            if req.settings().is_empty() { "null" } else { req.settings() },
+        )),
         "/health" | "/health/" => Response::text("ok"),
         "/echo" => Response::json(format!(
             r#"{{"method":"{}","query":"{}","body":"{}"}}"#,

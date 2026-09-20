@@ -209,11 +209,37 @@ owns HTTP framing, chunking, backpressure, and disconnect detection. An
 in-flight stream holds the loaded library alive, including across an ordinary
 function hot reload.
 
-Gatekeeper remains backward-compatible with ABI v2 functions. It reads their
-original buffered-response layout and does not require the v3 stream symbols;
-existing deployed functions therefore keep working unchanged. New SDK builds
-emit ABI v3 so they can opt into streaming. Versions other than 2 and 3 are
-rejected before any request or response structure is accessed.
+ABI v4 completes the picture in the other direction: a **request** body can
+stream too. Set `stream_request` on the route and the gate stops reading the
+body into its own memory — it hands the function a pull callback instead, which
+`Request::reader()` presents as an ordinary `Read`:
+
+```toml
+function = { library = "/opt/functions/libstore.so", stream_request = true }
+```
+
+Without it, a route that accepts uploads had to buffer every byte in the gate.
+That single limitation is why this repository's release store spent its first
+weeks as a native route target compiled into the gate rather than a function;
+it is now `funcs/coil-release`, and the gate knows nothing about it.
+
+v4 also hands a function two things it previously had to infer from headers:
+
+| accessor              | what it is |
+|-----------------------|------------|
+| `Request::auth()`     | the gate's own statement about the credential it verified — principal, scopes, and for a GitHub Actions token the workflow/run claims. Built by the gate, so a client cannot forge it by setting a header. Empty on a public route. |
+| `Request::settings()` | the route's `settings` table as JSON. The gate carries it through and never interprets a field, so a function's configuration stays out of the gate's config types. |
+
+A response that declares a length (`Response::stream_len`) is framed with a real
+`Content-Length` rather than chunked, which is what makes a large download
+resumable and a `HEAD` useful.
+
+Gatekeeper remains backward-compatible with ABI v2 and v3 functions. v2 keeps its
+original buffered-response layout and is not required to export the stream
+symbols; v3 reads the prefix of the request struct it knows, since v4 only
+appended fields. Existing deployed functions therefore keep working unchanged
+across a gate upgrade. Versions other than 2, 3 and 4 are rejected before any
+request or response structure is accessed.
 
 ### How it works (and why it's safe to run in process)
 
@@ -244,6 +270,13 @@ a proxy upstream. The gate does not sandbox arbitrary dylibs; don't point a
 | `gatekeeper-abi`       | gate **and** function | the `#[repr(C)]` request/response + ABI version. Tiny, no deps. |
 | `gatekeeper-fn`        | your function     | the `Request`/`Response` types + `#[handler]` macro. The only crate your app needs. |
 | `gatekeeper-fn-macro`  | (re-exported)     | the proc-macro behind `#[handler]`. |
+
+A route admits a caller with `scopes` (**all** of them) or `any_scopes` (**any
+one**). Use `any_scopes` when one route serves callers of different authority and
+the function behind it draws the finer line from `Request::auth()`. With neither
+set, a private route admits only a credential holding blanket authority — a
+narrowly scoped identity such as a GitHub workflow is refused a route that never
+named its scope.
 
 `funcs/hello` is a complete worked example. After `cargo build -p hello-fn`, run
 the gate with a route pointing at `target/debug/libhello_fn.so` and `curl` it.

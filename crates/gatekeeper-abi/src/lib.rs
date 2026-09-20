@@ -44,7 +44,15 @@ use std::os::raw::c_char;
 /// streaming body. Stream callbacks are deliberately pull-based: the gate does
 /// not let a function write directly to its client socket, so it can enforce
 /// backpressure and own disconnect handling.
-pub const GK_ABI_VERSION: u32 = 3;
+///
+/// v4: the *request* body streams too, by the mirror of the v3 mechanism — the
+/// gate supplies the pull callback instead of the function. Without it a route
+/// that accepts large uploads had to buffer every byte in the gate's memory,
+/// which is why the one such route in this repository was a native target
+/// rather than a function. v4 also hands the function two things it previously
+/// could only guess at from headers: the gate's own view of the authenticated
+/// caller, and the route's opaque settings.
+pub const GK_ABI_VERSION: u32 = 4;
 
 pub const GK_BODY_BUFFERED: u32 = 0;
 pub const GK_BODY_STREAM: u32 = 1;
@@ -60,6 +68,16 @@ pub const GK_FREE_SYMBOL: &[u8] = b"gk_free";
 pub const GK_STREAM_READ_SYMBOL: &[u8] = b"gk_stream_read";
 /// `extern "C" fn(*mut c_void)`. Called exactly once for every non-null stream.
 pub const GK_STREAM_FREE_SYMBOL: &[u8] = b"gk_stream_free";
+
+/// Pull the next bytes of a streaming request body.
+///
+/// The mirror of [`GK_STREAM_READ_SYMBOL`], in the other direction: here the
+/// **gate** provides the callback and the function calls it, because a function
+/// cannot look up a symbol in the process that loaded it. Same convention —
+/// positive is bytes written into `buf`, zero is end of body, negative is an
+/// error. Valid only for the duration of the handle call; the gate owns and
+/// releases the state, so the function never frees it.
+pub type GkBodyRead = extern "C" fn(*mut std::ffi::c_void, *mut u8, usize) -> isize;
 /// Name of the REQUIRED self-description function:
 /// `extern "C" fn() -> *mut GkResponse`.
 ///
@@ -127,9 +145,30 @@ pub struct GkRequest {
     /// Borrowed array of `header_count` headers.
     pub headers_ptr: *const GkHeader,
     pub header_count: usize,
-    /// Request body bytes (may be empty).
+    /// Request body bytes (may be empty). Meaningful only when `body_kind` is
+    /// [`GK_BODY_BUFFERED`].
     pub body_ptr: *const u8,
     pub body_len: usize,
+    /// [`GK_BODY_BUFFERED`] or [`GK_BODY_STREAM`]. A route opts into streaming;
+    /// functions that do not ask for it keep seeing a complete buffered body.
+    pub body_kind: u32,
+    /// Gate-owned stream state. Null unless `body_kind` is [`GK_BODY_STREAM`].
+    pub body_stream_ptr: *mut std::ffi::c_void,
+    /// Gate-provided pull callback. Null unless `body_kind` is [`GK_BODY_STREAM`].
+    pub body_read: Option<GkBodyRead>,
+    /// Declared body length, or `u64::MAX` when the client did not declare one.
+    pub body_total: u64,
+    /// The gate's own view of the authenticated caller, as UTF-8 JSON:
+    /// `{"principal": "...", "scopes": [...], "claims": {...}}`. Built by the
+    /// gate from the credential it verified, never copied out of a header, so a
+    /// client cannot forge it. Empty for a public route.
+    pub auth_ptr: *const c_char,
+    pub auth_len: usize,
+    /// The route's `settings` table, as UTF-8 JSON. Opaque: the gate carries it
+    /// from config to the function and never interprets a field. Empty when the
+    /// route configures none.
+    pub settings_ptr: *const c_char,
+    pub settings_len: usize,
 }
 
 /// The response a function returns. The function **owns** this allocation; the
@@ -145,6 +184,12 @@ pub struct GkResponse {
     pub header_count: usize,
     /// Owned body bytes. May be null iff `body_len == 0`.
     pub body_ptr: *mut u8,
+    /// For [`GK_BODY_BUFFERED`], the body's length. For [`GK_BODY_STREAM`], the
+    /// total the stream will produce, or `0` when the function does not know it
+    /// — the gate frames a known length as `Content-Length` and an unknown one
+    /// as chunked. Reusing this field rather than adding one keeps the response
+    /// layout identical to v3, so v3 dylibs (which always wrote `0` here for a
+    /// stream) keep meaning exactly what they meant.
     pub body_len: usize,
     /// [`GK_BODY_BUFFERED`] or [`GK_BODY_STREAM`].
     pub body_kind: u32,

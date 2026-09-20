@@ -6,6 +6,7 @@ members = [
     "crates/gatekeeper-fn-macro",
     "funcs/hello",
     "funcs/analytics",
+    "funcs/coil-release",
     "funcs/polls",
     "funcs/nodescribe",
     "funcs/v2-compat",

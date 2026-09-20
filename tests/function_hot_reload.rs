@@ -14,7 +14,7 @@
 
 use std::path::{Path, PathBuf};
 
-use gatekeeper::function::FunctionRegistry;
+use gatekeeper::function::{Call, FunctionRegistry};
 
 fn target_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -61,7 +61,7 @@ fn rebuilt_dylib_is_picked_up_without_restart() {
     // v1 = hello.
     deploy(&hello, &live);
     let reg = FunctionRegistry::new();
-    let r1 = reg.invoke(&live, "GET", "/hello", "", &[], b"");
+    let r1 = reg.invoke(&live, Call::buffered("GET", "/hello", "", &[], b""));
     assert_eq!(r1.status, 200, "v1 hello should serve 200");
     let body1 = String::from_utf8_lossy(&r1.body);
     assert!(
@@ -73,7 +73,7 @@ fn rebuilt_dylib_is_picked_up_without_restart() {
     // handler has no "/hello" endpoint, so it returns 404 — a behavior change
     // that proves the NEW code is running.
     deploy(&analytics, &live);
-    let r2 = reg.invoke(&live, "GET", "/hello", "", &[], b"");
+    let r2 = reg.invoke(&live, Call::buffered("GET", "/hello", "", &[], b""));
     let body2 = String::from_utf8_lossy(&r2.body).to_string();
 
     // The claim under test is "v2 is live", and v1 is unmistakable: 200 plus
@@ -111,7 +111,7 @@ fn rebuilt_dylib_is_picked_up_without_restart() {
 
     // And swapping BACK to v1 is picked up too (not a one-way latch).
     deploy(&hello, &live);
-    let r3 = reg.invoke(&live, "GET", "/hello", "", &[], b"");
+    let r3 = reg.invoke(&live, Call::buffered("GET", "/hello", "", &[], b""));
     assert_eq!(r3.status, 200, "swapping back to hello should serve 200 again");
     assert!(String::from_utf8_lossy(&r3.body).contains("hello from a gatekeeper function"));
 
@@ -129,7 +129,7 @@ fn unchanged_dylib_is_served_from_cache() {
 
     let reg = FunctionRegistry::new();
     for _ in 0..5 {
-        let r = reg.invoke(&live, "GET", "/x", "", &[], b"");
+        let r = reg.invoke(&live, Call::buffered("GET", "/x", "", &[], b""));
         assert_eq!(r.status, 200);
     }
     let _ = std::fs::remove_file(&live);
@@ -154,11 +154,13 @@ fn service_dylib_is_pinned_when_the_file_changes() {
             barrier.wait();
             reg.invoke_service(
                 &live,
-                "GET",
-                "/hello",
-                "",
-                &[],
-                b"",
+                Call::buffered(
+                    "GET",
+                    "/hello",
+                    "",
+                    &[],
+                    b"",
+                ),
             )
         }));
     }
@@ -170,11 +172,13 @@ fn service_dylib_is_pinned_when_the_file_changes() {
     deploy(&analytics, &live);
     let r2 = reg.invoke_service(
         &live,
-        "GET",
-        "/hello",
-        "",
-        &[],
-        b"",
+        Call::buffered(
+            "GET",
+            "/hello",
+            "",
+            &[],
+            b"",
+        ),
     );
     assert_eq!(r2.status, 200, "service functions must not hot-reload");
     assert!(String::from_utf8_lossy(&r2.body).contains("hello from a gatekeeper function"));

@@ -17,9 +17,9 @@ fn route(path: &str, public: bool) -> Route {
         dashboard: false,
         proxy: None,
         function: None,
-        release_store: None,
         public,
         scopes: Vec::new(),
+        any_scopes: Vec::new(),
     }
 }
 

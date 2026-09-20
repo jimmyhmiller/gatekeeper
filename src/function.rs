@@ -84,6 +84,92 @@ type StreamReadFn = unsafe extern "C" fn(*mut std::ffi::c_void, *mut u8, usize) 
 type StreamFreeFn = unsafe extern "C" fn(*mut std::ffi::c_void);
 
 const GK_ABI_VERSION_V2: u32 = 2;
+/// Every ABI the gate can still call. v4 only appended fields to `GkRequest`
+/// and left `GkResponse` alone, so a v3 dylib reads the prefix it knows and a
+/// v2 dylib keeps its own response struct. Dropping an older one here is what
+/// would force every deployed function to be rebuilt at once.
+const SUPPORTED_ABI: [u32; 3] = [GK_ABI_VERSION_V2, 3, GK_ABI_VERSION];
+
+/// Everything the gate hands a function for one request.
+///
+/// Grouped into a struct because v4 added three things at once (a streaming
+/// body, the verified caller, the route's settings) and a seven-argument
+/// `invoke` is how call sites start passing the wrong string to the wrong
+/// parameter.
+pub struct Call<'a> {
+    pub method: &'a str,
+    /// Path after the matched route prefix, already normalized by the gate.
+    pub path: &'a str,
+    /// Raw query string, without the leading `?`.
+    pub query: &'a str,
+    pub headers: &'a [tiny_http::Header],
+    pub body: CallBody<'a>,
+    /// The gate's view of the caller, as JSON. Empty on a public route.
+    pub auth: &'a str,
+    /// The route's `settings` table, as JSON. Empty when it configures none.
+    pub settings: &'a str,
+}
+
+impl<'a> Call<'a> {
+    /// A call with a complete body and nothing else to say: no verified caller,
+    /// no route settings. What a public route sends, and what a test wants.
+    pub fn buffered(
+        method: &'a str,
+        path: &'a str,
+        query: &'a str,
+        headers: &'a [tiny_http::Header],
+        body: &'a [u8],
+    ) -> Self {
+        Call {
+            method,
+            path,
+            query,
+            headers,
+            body: CallBody::Buffered(body),
+            auth: "",
+            settings: "",
+        }
+    }
+}
+
+/// What the gate hands a function as the request body.
+pub enum CallBody<'a> {
+    /// The gate read the whole body first. What every function saw before v4.
+    Buffered(&'a [u8]),
+    /// The gate holds the connection and the function pulls. A route asks for
+    /// this when its bodies are too large to sit in the gate's memory.
+    Stream {
+        reader: &'a mut dyn std::io::Read,
+        total: u64,
+    },
+}
+
+/// The gate-owned state behind a streaming request body, borrowed for exactly
+/// one call.
+struct BodyPull<'a> {
+    reader: &'a mut dyn std::io::Read,
+}
+
+/// The gate's half of the v4 request-body contract. Mirrors the function's
+/// `gk_stream_read`: positive is bytes read, zero is end of body, negative is an
+/// error. A panic must not cross back into the dylib, so it becomes an error.
+extern "C" fn body_read(ctx: *mut std::ffi::c_void, buf: *mut u8, cap: usize) -> isize {
+    if ctx.is_null() || buf.is_null() || cap == 0 {
+        return 0;
+    }
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: `ctx` is the BodyPull this call's GkRequest was built with and
+        // outlives the call; `buf`/`cap` describe a writable region the function
+        // owns for the duration of this callback.
+        let pull = unsafe { &mut *ctx.cast::<BodyPull>() };
+        let slice = unsafe { std::slice::from_raw_parts_mut(buf, cap) };
+        pull.reader.read(slice)
+    }));
+    match result {
+        Ok(Ok(n)) => n as isize,
+        _ => -1,
+    }
+}
 
 /// Frozen response layout from ABI v2. Requests and headers did not change in
 /// v3, but responses gained body discrimination and stream state. Keeping the
@@ -208,56 +294,36 @@ impl FunctionRegistry {
     pub fn invoke(
         &self,
         lib_path: &std::path::Path,
-        method: &str,
-        path: &str,
-        query: &str,
-        headers: &[tiny_http::Header],
-        body: &[u8],
+        call: Call<'_>,
     ) -> Reply {
-        let func = match self.get_or_load(lib_path, FunctionLifecycle::Reloadable) {
-            Ok(f) => f,
-            Err(e) => {
-                return Reply::status(502, &format!("Bad Gateway: function load failed: {e}"))
-            }
-        };
-        call_function(func, method, path, query, headers, body)
+        self.invoke_with_lifecycle(lib_path, FunctionLifecycle::Reloadable, call)
     }
 
     pub fn invoke_service(
         &self,
         lib_path: &std::path::Path,
-        method: &str,
-        path: &str,
-        query: &str,
-        headers: &[tiny_http::Header],
-        body: &[u8],
+        call: Call<'_>,
     ) -> Reply {
-        let func = match self.get_or_load(lib_path, FunctionLifecycle::Service) {
+        self.invoke_with_lifecycle(lib_path, FunctionLifecycle::Service, call)
+    }
+
+    fn invoke_with_lifecycle(
+        &self,
+        lib_path: &std::path::Path,
+        lifecycle: FunctionLifecycle,
+        call: Call<'_>,
+    ) -> Reply {
+        let func = match self.get_or_load(lib_path, lifecycle) {
             Ok(f) => f,
             Err(e) => {
                 return Reply::status(502, &format!("Bad Gateway: function load failed: {e}"))
             }
         };
-        call_function(func, method, path, query, headers, body)
+        call_function(func, call)
     }
 
-    pub fn invoke_target(
-        &self,
-        target: &FunctionTarget,
-        method: &str,
-        path: &str,
-        query: &str,
-        headers: &[tiny_http::Header],
-        body: &[u8],
-    ) -> Reply {
-        match target.lifecycle() {
-            FunctionLifecycle::Reloadable => {
-                self.invoke(target.library(), method, path, query, headers, body)
-            }
-            FunctionLifecycle::Service => {
-                self.invoke_service(target.library(), method, path, query, headers, body)
-            }
-        }
+    pub fn invoke_target(&self, target: &FunctionTarget, call: Call<'_>) -> Reply {
+        self.invoke_with_lifecycle(target.library(), target.lifecycle(), call)
     }
 
     /// Ask the function dylib at `lib_path` to describe itself (ABI v2). Loads it
@@ -481,10 +547,9 @@ fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, St
         };
 
         let got = unsafe { version() };
-        if got != GK_ABI_VERSION_V2 && got != GK_ABI_VERSION {
+        if !SUPPORTED_ABI.contains(&got) {
             return Err(format!(
-                "ABI version mismatch: dylib reports {got}, gate supports \
-                 {GK_ABI_VERSION_V2} and {GK_ABI_VERSION}"
+                "ABI version mismatch: dylib reports {got}, gate supports {SUPPORTED_ABI:?}"
             ));
         }
 
@@ -497,7 +562,8 @@ fn load_library(lib_path: &std::path::Path, pinned: bool) -> Result<LoadedFn, St
                 format!("symbol gk_describe: {e} (every function must have a #[describe])")
             })?
         };
-        let (stream_read, stream_free) = if got == GK_ABI_VERSION {
+        // Every ABI that can return a streaming response exports the pull pair.
+        let (stream_read, stream_free) = if got >= 3 {
             let read: StreamReadFn = unsafe {
                 *lib.get(GK_STREAM_READ_SYMBOL)
                     .map_err(|e| format!("symbol gk_stream_read: {e}"))?
@@ -561,14 +627,8 @@ fn unique_temp_path(lib_path: &std::path::Path) -> std::path::PathBuf {
 /// Marshal a request, call `gk_handle`, copy the response out, free it. All the
 /// borrowed buffers (method/path/query/headers/body) live on this stack frame
 /// for the whole duration of the call, satisfying the ABI's borrow contract.
-fn call_function(
-    func: Arc<LoadedFn>,
-    method: &str,
-    path: &str,
-    query: &str,
-    headers: &[tiny_http::Header],
-    body: &[u8],
-) -> Reply {
+fn call_function(func: Arc<LoadedFn>, call: Call<'_>) -> Reply {
+    let Call { method, path, query, headers, body, auth, settings } = call;
     // Stage header name/value bytes into owned buffers we control, then build
     // the GkHeader array pointing into them. Both buffers and the array outlive
     // the call.
@@ -591,6 +651,32 @@ fn call_function(
         })
         .collect();
 
+    // The streaming case keeps `pull` alive on this frame for the whole call, so
+    // the pointer the function receives stays valid exactly as long as the ABI
+    // promises and no longer.
+    let mut pull;
+    let (body_ptr, body_len, body_kind, body_stream_ptr, body_read_fn, body_total) = match body {
+        CallBody::Buffered(bytes) => (
+            bytes.as_ptr(),
+            bytes.len(),
+            GK_BODY_BUFFERED,
+            std::ptr::null_mut(),
+            None,
+            bytes.len() as u64,
+        ),
+        CallBody::Stream { reader, total } => {
+            pull = BodyPull { reader };
+            (
+                std::ptr::null(),
+                0,
+                GK_BODY_STREAM,
+                (&mut pull) as *mut BodyPull as *mut std::ffi::c_void,
+                Some(body_read as gatekeeper_abi::GkBodyRead),
+                total,
+            )
+        }
+    };
+
     let req = GkRequest {
         method_ptr: method.as_ptr() as *const c_char,
         method_len: method.len(),
@@ -600,8 +686,16 @@ fn call_function(
         query_len: query.len(),
         headers_ptr: gk_headers.as_ptr(),
         header_count: gk_headers.len(),
-        body_ptr: body.as_ptr(),
-        body_len: body.len(),
+        body_ptr,
+        body_len,
+        body_kind,
+        body_stream_ptr,
+        body_read: body_read_fn,
+        body_total,
+        auth_ptr: auth.as_ptr() as *const c_char,
+        auth_len: auth.len(),
+        settings_ptr: settings.as_ptr() as *const c_char,
+        settings_len: settings.len(),
     };
 
     // SAFETY: req's buffers are all alive on this frame; handle is a valid fn
@@ -639,16 +733,18 @@ unsafe fn copy_response(resp_ptr: *const std::ffi::c_void, func: Arc<LoadedFn>) 
             };
             Reply::new(resp.status, body)
         }
-        GK_BODY_STREAM if !resp.stream_ptr.is_null() => Reply::stream(
+        GK_BODY_STREAM if !resp.stream_ptr.is_null() => Reply::stream_maybe_len(
             resp.status,
+            // 0 means the function did not declare a total; frame it chunked.
+            (resp.body_len != 0).then_some(resp.body_len),
             Box::new(FunctionStream {
                 state: resp.stream_ptr,
                 read: func
                     .stream_read
-                    .expect("ABI v3 libraries are loaded with gk_stream_read"),
+                    .expect("a streaming ABI is loaded with gk_stream_read"),
                 free: func
                     .stream_free
-                    .expect("ABI v3 libraries are loaded with gk_stream_free"),
+                    .expect("a streaming ABI is loaded with gk_stream_free"),
                 _func: func,
                 done: false,
             }),

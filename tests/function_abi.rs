@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use gatekeeper::function::FunctionRegistry;
+use gatekeeper::function::{Call, CallBody, FunctionRegistry};
 
 /// Path to the example dylib, built by `cargo build -p hello-fn`. We locate it
 /// relative to the test binary's target dir so it works in debug and release.
@@ -86,7 +86,7 @@ fn invoke_covers_request_shapes() {
     let lib = dylib_path();
 
     // Plain GET, no headers, no body -> the catch-all HTML response.
-    let r = reg.invoke(&lib, "GET", "/anything", "", &[], &[]);
+    let r = reg.invoke(&lib, Call::buffered("GET", "/anything", "", &[], &[]));
     assert_eq!(r.status, 200);
     assert!(String::from_utf8_lossy(&r.body).contains("/anything"));
     assert!(r
@@ -95,13 +95,13 @@ fn invoke_covers_request_shapes() {
         .any(|(k, v)| k == "Content-Type" && v.contains("text/html")));
 
     // Health route.
-    let r = reg.invoke(&lib, "GET", "/health", "", &[], &[]);
+    let r = reg.invoke(&lib, Call::buffered("GET", "/health", "", &[], &[]));
     assert_eq!(r.status, 200);
     assert_eq!(r.body, b"ok");
 
     // Echo with headers, query and a body — exercises every borrowed field.
     let headers = [hdr("X-Test", "abc"), hdr("Accept", "application/json")];
-    let r = reg.invoke(&lib, "POST", "/echo", "a=1&b=2", &headers, b"payload");
+    let r = reg.invoke(&lib, Call::buffered("POST", "/echo", "a=1&b=2", &headers, b"payload"));
     assert_eq!(r.status, 200);
     let body = String::from_utf8_lossy(&r.body);
     assert!(body.contains("\"method\":\"POST\""), "{body}");
@@ -132,7 +132,7 @@ fn describe_returns_self_description() {
 fn abi_v2_buffered_function_remains_compatible() {
     let reg = FunctionRegistry::new();
     let lib = v2_dylib_path();
-    let response = reg.invoke(&lib, "GET", "/legacy", "", &[], &[]);
+    let response = reg.invoke(&lib, Call::buffered("GET", "/legacy", "", &[], &[]));
     assert_eq!(response.status, 200);
     assert_eq!(response.body, b"v2 buffered response for /legacy");
     assert!(!response.is_stream());
@@ -160,7 +160,7 @@ fn function_without_describe_is_rejected() {
         return;
     }
     let reg = FunctionRegistry::new();
-    let r = reg.invoke(&lib, "GET", "/x", "", &[], &[]);
+    let r = reg.invoke(&lib, Call::buffered("GET", "/x", "", &[], &[]));
     assert_eq!(
         r.status, 502,
         "a function without #[describe] must fail to load"
@@ -177,7 +177,7 @@ fn handler_panic_becomes_500_not_abort() {
     let lib = dylib_path();
     // The /panic route panics; the SDK catches it and returns 500. If the panic
     // unwound across the ABI this test would abort the whole process instead.
-    let r = reg.invoke(&lib, "GET", "/panic", "", &[], &[]);
+    let r = reg.invoke(&lib, Call::buffered("GET", "/panic", "", &[], &[]));
     assert_eq!(r.status, 500);
 }
 
@@ -189,7 +189,7 @@ fn repeated_invocations_reuse_cached_library() {
     let lib = dylib_path();
     for i in 0..50 {
         let q = format!("n={i}");
-        let r = reg.invoke(&lib, "GET", "/echo", &q, &[hdr("X-N", &q)], q.as_bytes());
+        let r = reg.invoke(&lib, Call::buffered("GET", "/echo", &q, &[hdr("X-N", &q)], q.as_bytes()));
         assert_eq!(r.status, 200);
     }
 }
@@ -197,7 +197,7 @@ fn repeated_invocations_reuse_cached_library() {
 #[test]
 fn streaming_response_crosses_the_native_abi() {
     let reg = FunctionRegistry::new();
-    let response = reg.invoke(&dylib_path(), "GET", "/sse", "", &[], &[]);
+    let response = reg.invoke(&dylib_path(), Call::buffered("GET", "/sse", "", &[], &[]));
     assert_eq!(response.status, 200);
     assert!(response.is_stream());
     assert!(response
@@ -213,12 +213,82 @@ fn missing_dylib_fails_closed() {
     let reg = FunctionRegistry::new();
     let r = reg.invoke(
         &PathBuf::from("definitely/not/a/real.so"),
-        "GET",
-        "/x",
-        "",
-        &[],
-        &[],
+        Call::buffered(
+            "GET",
+            "/x",
+            "",
+            &[],
+            &[],
+        ),
     );
     // Load failure -> 502, never a panic.
     assert_eq!(r.status, 502);
+}
+
+/// The v4 capability that let the release store stop being part of the gate: a
+/// body crosses the ABI as a stream, so a route can accept an upload far larger
+/// than anything the gate would be willing to hold in memory.
+#[test]
+fn request_bodies_cross_the_abi_as_a_stream() {
+    let lib = dylib_path();
+    let reg = FunctionRegistry::new();
+
+    // Bigger than any buffer on either side of the boundary, and not a multiple
+    // of the function's chunk size, so a partial final read is exercised.
+    const SIZE: u64 = 9 * 1024 * 1024 + 7;
+    let mut source = std::io::Read::take(std::io::repeat(b'c'), SIZE);
+    let response = reg.invoke(
+        &lib,
+        Call {
+            method: "POST",
+            path: "/drain",
+            query: "",
+            headers: &[],
+            body: CallBody::Stream { reader: &mut source, total: SIZE },
+            auth: "",
+            settings: "",
+        },
+    );
+    assert_eq!(response.status, 200);
+    let body = String::from_utf8(response.body).unwrap();
+    assert_eq!(body, format!(r#"{{"bytes":{SIZE},"streamed":true}}"#));
+
+    // The same handler still sees a complete buffer on an ordinary route.
+    let response = reg.invoke(&lib, Call::buffered("POST", "/drain", "", &[], b"twelve bytes"));
+    assert_eq!(
+        String::from_utf8(response.body).unwrap(),
+        r#"{"bytes":12,"streamed":false}"#
+    );
+}
+
+/// The caller and the route's settings reach a function as gate-built JSON, not
+/// as headers a client could have set.
+#[test]
+fn the_gate_states_who_called_and_how_the_route_is_configured() {
+    let lib = dylib_path();
+    let reg = FunctionRegistry::new();
+    let auth = r#"{"principal":"github-actions","scopes":["releases:publish"],"claims":{"run_id":"7"}}"#;
+    let settings = r#"{"root":"/var/lib/releases"}"#;
+    let response = reg.invoke(
+        &lib,
+        Call {
+            method: "GET",
+            path: "/whoami",
+            query: "",
+            // A client trying to forge the same thing through headers.
+            headers: &[tiny_http::Header::from_bytes(
+                &b"X-Gatekeeper-Auth"[..],
+                &br#"{"scopes":["*"]}"#[..],
+            )
+            .unwrap()],
+            body: CallBody::Buffered(b""),
+            auth,
+            settings,
+        },
+    );
+    assert_eq!(response.status, 200);
+    let seen: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(seen["auth"]["scopes"][0], "releases:publish");
+    assert_eq!(seen["auth"]["claims"]["run_id"], "7");
+    assert_eq!(seen["settings"]["root"], "/var/lib/releases");
 }

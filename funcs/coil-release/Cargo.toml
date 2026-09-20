@@ -1,0 +1,16 @@
+[package]
+name = "coil-release-fn"
+version = "0.1.0"
+edition = "2021"
+description = "Gatekeeper function: transactional private release publication and download for the Coil toolchain."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+gatekeeper-fn = { path = "../../crates/gatekeeper-fn" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+libc = "0.2"
+uuid = { version = "1", features = ["v4"] }

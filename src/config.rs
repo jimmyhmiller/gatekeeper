@@ -179,10 +179,6 @@ pub struct Route {
     /// Mutually exclusive with `static` and `proxy`.
     #[serde(default)]
     pub function: Option<FunctionTarget>,
-    /// Transactional, private release storage. Unlike `static`, this streams
-    /// large uploads/downloads and owns publication semantics.
-    #[serde(default)]
-    pub release_store: Option<ReleaseStoreConfig>,
     /// Serve the built-in dashboard: a human-readable index of everything this
     /// gate exposes. Mutually exclusive with the other target kinds.
     ///
@@ -195,27 +191,45 @@ pub struct Route {
     /// Public routes skip auth. **Defaults to false** — fail safe.
     #[serde(default)]
     pub public: bool,
-    /// Scopes required after authentication. Empty preserves the historical
-    /// rule: any configured credential may access this private route.
+    /// Scopes required after authentication — **all** of them. Empty preserves
+    /// the historical rule: any configured credential may access this private
+    /// route.
     #[serde(default)]
     pub scopes: Vec<String>,
+    /// Scopes of which the caller needs **any one**. Use this when a single
+    /// route serves callers with different authority — a reader and a publisher,
+    /// say — and the function behind it makes the finer distinction from
+    /// `Request::auth()`. Combines with `scopes`: all of `scopes`, and at least
+    /// one of `any_scopes`.
+    #[serde(default)]
+    pub any_scopes: Vec<String>,
 }
 
 /// A function route may use the original path shorthand or an explicit target.
 /// Service functions can keep executing after a request returns, so their
 /// library must remain mapped for the life of the Gatekeeper process.
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(untagged)]
 pub enum FunctionTarget {
     Library(PathBuf),
     Config(FunctionConfig),
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 pub struct FunctionConfig {
     pub library: PathBuf,
     #[serde(default)]
     pub lifecycle: FunctionLifecycle,
+    /// Hand the function the request body as a stream instead of reading it all
+    /// into the gate's memory first. Required for routes that accept uploads
+    /// too large to buffer; the function sees them through `Request::reader()`.
+    #[serde(default)]
+    pub stream_request: bool,
+    /// The function's own configuration. The gate carries this table through to
+    /// the function verbatim and never interprets a field — that is what keeps a
+    /// function's settings out of the gate's own config types.
+    #[serde(default)]
+    pub settings: Option<toml::Value>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash, Default)]
@@ -240,6 +254,26 @@ impl FunctionTarget {
             FunctionTarget::Config(config) => config.lifecycle,
         }
     }
+
+    pub fn stream_request(&self) -> bool {
+        match self {
+            FunctionTarget::Library(_) => false,
+            FunctionTarget::Config(config) => config.stream_request,
+        }
+    }
+
+    /// The route's `settings` table as JSON, or `""` when it configures none.
+    /// Rendered per request; these tables are a handful of keys, and caching it
+    /// would mean a cache to invalidate on every config reload.
+    pub fn settings_json(&self) -> String {
+        match self {
+            FunctionTarget::Library(_) => String::new(),
+            FunctionTarget::Config(config) => match &config.settings {
+                None => String::new(),
+                Some(value) => serde_json::to_string(value).unwrap_or_default(),
+            },
+        }
+    }
 }
 
 /// The resolved target of a route after validation.
@@ -248,52 +282,18 @@ pub enum Target {
     Static(PathBuf),
     Proxy(String),
     Function(FunctionTarget),
-    ReleaseStore(ReleaseStoreConfig),
     Dashboard,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct ReleaseStoreConfig {
-    pub root: PathBuf,
-    #[serde(default = "default_release_read_scope")]
-    pub read_scope: String,
-    #[serde(default = "default_release_publish_scope")]
-    pub publish_scope: String,
-    #[serde(default = "default_max_artifact_bytes")]
-    pub max_artifact_bytes: u64,
-    #[serde(default = "default_release_retention")]
-    pub retain_builds: usize,
-}
-
-fn default_release_read_scope() -> String {
-    "coil:read".into()
-}
-fn default_release_publish_scope() -> String {
-    "coil:nightly:publish".into()
-}
-fn default_max_artifact_bytes() -> u64 {
-    512 * 1024 * 1024
-}
-fn default_release_retention() -> usize {
-    14
 }
 
 impl Route {
     /// The validated target. Exactly one of `static`/`proxy`/`function` must be
     /// set; this is enforced by [`Config::validate`], so here we assume it holds.
     pub fn target(&self) -> Target {
-        match (
-            &self.static_dir,
-            &self.proxy,
-            &self.function,
-            &self.release_store,
-            self.dashboard,
-        ) {
-            (Some(dir), None, None, None, false) => Target::Static(dir.clone()),
-            (None, Some(up), None, None, false) => Target::Proxy(up.clone()),
-            (None, None, Some(lib), None, false) => Target::Function(lib.clone()),
-            (None, None, None, Some(store), false) => Target::ReleaseStore(store.clone()),
-            (None, None, None, None, true) => Target::Dashboard,
+        match (&self.static_dir, &self.proxy, &self.function, self.dashboard) {
+            (Some(dir), None, None, false) => Target::Static(dir.clone()),
+            (None, Some(up), None, false) => Target::Proxy(up.clone()),
+            (None, None, Some(lib), false) => Target::Function(lib.clone()),
+            (None, None, None, true) => Target::Dashboard,
             // validate() rejects every other combination before we get here.
             _ => unreachable!("route target validated at load time"),
         }
@@ -376,7 +376,6 @@ impl Config {
                 r.static_dir.is_some(),
                 r.proxy.is_some(),
                 r.function.is_some(),
-                r.release_store.is_some(),
                 r.dashboard,
             ]
             .iter()
@@ -385,7 +384,7 @@ impl Config {
             match set {
                 0 => {
                     return Err(ConfigError(format!(
-                        "route {:?} sets no target — pick static, proxy, function, release_store, or dashboard",
+                        "route {:?} sets no target — pick static, proxy, function, or dashboard",
                         r.path
                     )));
                 }
@@ -397,24 +396,13 @@ impl Config {
                     )));
                 }
             }
-            if let Some(store) = &r.release_store {
-                if r.public {
-                    return Err(ConfigError(format!(
-                        "release_store route {:?} must remain private",
-                        r.path
-                    )));
-                }
-                if store.root.as_os_str().is_empty()
-                    || store.read_scope.trim().is_empty()
-                    || store.publish_scope.trim().is_empty()
-                    || store.max_artifact_bytes == 0
-                    || store.retain_builds < 2
-                {
-                    return Err(ConfigError(format!(
-                        "release_store route {:?} has invalid root/scopes/limits",
-                        r.path
-                    )));
-                }
+            // A scope gate on a public route is a contradiction that reads as
+            // security: the route never authenticates, so nothing is checked.
+            if r.public && !(r.scopes.is_empty() && r.any_scopes.is_empty()) {
+                return Err(ConfigError(format!(
+                    "route {:?} is public but sets scopes — a public route never authenticates",
+                    r.path
+                )));
             }
         }
         // Duplicate exact paths are almost certainly a mistake (which one wins
@@ -718,26 +706,26 @@ mod tests {
         let cfg = Config::from_toml(
             r#"
             [github_oidc]
-            audience = "https://computer.example/coil/releases"
+            audience = "https://gate.example/releases"
 
             [[github_oidc.policy]]
-            name = "coil-nightly"
+            name = "example-nightly"
             repository_id = "123"
             repository_owner_id = "456"
             ref = "refs/heads/main"
-            workflow_ref = "jimmyhmiller/coil/.github/workflows/nightly.yml@refs/heads/main"
+            workflow_ref = "acme/widgets/.github/workflows/nightly.yml@refs/heads/main"
             environment = "nightly-release"
             event_names = ["schedule", "workflow_dispatch"]
-            scopes = ["coil:nightly:publish"]
+            scopes = ["releases:publish"]
 
             [[route]]
-            path = "/coil"
+            path = "/releases"
             static = "/tmp"
-            scopes = ["coil:read"]
+            scopes = ["releases:read"]
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.route[0].scopes, ["coil:read"]);
+        assert_eq!(cfg.route[0].scopes, ["releases:read"]);
         assert_eq!(cfg.github_oidc.unwrap().policy[0].repository_id, "123");
     }
 
@@ -746,10 +734,10 @@ mod tests {
         let err = Config::from_toml(
             r#"
             [github_oidc]
-            audience = "https://computer.example/coil/releases"
+            audience = "https://gate.example/releases"
 
             [[route]]
-            path = "/coil"
+            path = "/releases"
             static = "/tmp"
             "#,
         )
@@ -758,28 +746,39 @@ mod tests {
     }
 
     #[test]
-    fn private_release_store_parses_and_public_one_is_rejected() {
+    fn function_settings_are_carried_through_without_interpretation() {
         let cfg = Config::from_toml(
             r#"
             [[route]]
-            path = "/coil/v1"
-            release_store = { root = "/tmp/releases" }
+            path = "/releases/v1"
+            any_scopes = ["releases:read", "releases:publish"]
+            function = { library = "/opt/fn/librelease.so", lifecycle = "service", stream_request = true, settings = { root = "/var/lib/releases", retain_builds = 14 } }
             "#,
         )
         .unwrap();
-        let store = cfg.route[0].release_store.as_ref().unwrap();
-        assert_eq!(store.read_scope, "coil:read");
-        assert_eq!(store.retain_builds, 14);
+        let target = cfg.route[0].function.as_ref().unwrap();
+        assert!(target.stream_request());
+        assert_eq!(target.lifecycle(), FunctionLifecycle::Service);
+        assert_eq!(cfg.route[0].any_scopes, ["releases:read", "releases:publish"]);
+        // The gate renders the table to JSON and knows nothing else about it.
+        let settings: serde_json::Value =
+            serde_json::from_str(&target.settings_json()).unwrap();
+        assert_eq!(settings["root"], "/var/lib/releases");
+        assert_eq!(settings["retain_builds"], 14);
+    }
 
+    #[test]
+    fn a_public_route_cannot_pretend_to_check_scopes() {
         let err = Config::from_toml(
             r#"
             [[route]]
-            path = "/coil/v1"
-            release_store = { root = "/tmp/releases" }
+            path = "/releases/v1"
+            static = "/tmp/site"
             public = true
+            any_scopes = ["releases:read"]
             "#,
         )
         .unwrap_err();
-        assert!(err.0.contains("must remain private"));
+        assert!(err.0.contains("never authenticates"));
     }
 }

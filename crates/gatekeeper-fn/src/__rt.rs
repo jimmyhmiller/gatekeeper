@@ -17,7 +17,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub use gatekeeper_abi::{GkHeader, GkRequest, GkResponse};
 
-use crate::{Request, Response, ResponseBody};
+use crate::{GateStream, Request, RequestBody, Response, ResponseBody};
 
 /// Reported to the gate so it can refuse a dylib built against a different ABI.
 pub fn abi_version() -> u32 {
@@ -112,13 +112,28 @@ unsafe fn marshal_request(r: &GkRequest) -> Request {
         }
     }
 
-    let body = if r.body_ptr.is_null() || r.body_len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(r.body_ptr, r.body_len).to_vec()
+    // A streaming body is not copied out: the gate keeps ownership and the
+    // handler pulls it through the callback for the duration of this call.
+    let body = match (r.body_kind, r.body_read) {
+        (gatekeeper_abi::GK_BODY_STREAM, Some(read)) => {
+            RequestBody::Stream(GateStream::new(r.body_stream_ptr, read))
+        }
+        _ if r.body_ptr.is_null() || r.body_len == 0 => RequestBody::Buffered {
+            bytes: Vec::new(),
+            read: 0,
+        },
+        _ => RequestBody::Buffered {
+            bytes: std::slice::from_raw_parts(r.body_ptr, r.body_len).to_vec(),
+            read: 0,
+        },
     };
+    let auth = bytes_to_string(r.auth_ptr, r.auth_len);
+    let settings = bytes_to_string(r.settings_ptr, r.settings_len);
 
-    Request { method, path, query, headers, body }
+    // u64::MAX is the ABI's "the client declared nothing".
+    let body_total = (r.body_total != u64::MAX).then_some(r.body_total);
+
+    Request { method, path, query, headers, body, body_total, auth, settings }
 }
 
 /// Build an owned `*mut GkResponse` from a [`Response`]. Each piece is leaked
@@ -163,9 +178,10 @@ fn into_raw_response(resp: Response) -> *mut GkResponse {
                 std::ptr::null_mut(),
             )
         }
-        ResponseBody::Stream(reader) => (
+        // For a stream, `body_len` carries the declared total (0 = unknown).
+        ResponseBody::Stream { reader, len } => (
             std::ptr::null_mut(),
-            0,
+            len.unwrap_or(0) as usize,
             gatekeeper_abi::GK_BODY_STREAM,
             Box::into_raw(Box::new(reader)) as *mut std::ffi::c_void,
         ),

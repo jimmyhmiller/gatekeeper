@@ -35,20 +35,25 @@ function = "target/release/libhello_fn.so"
 # GitHub Actions OIDC. A matching workflow receives only the listed scopes;
 # unlike the bootstrap token, it cannot enter ordinary private routes.
 # [github_oidc]
-# audience = "https://computer.example.com/coil/releases"
+# audience = "https://computer.example.com/releases"
 #
 # [[github_oidc.policy]]
-# name = "coil-nightly"
+# name = "nightly"
 # repository_id = "123456789"
 # repository_owner_id = "987654321"
 # ref = "refs/heads/main"
-# workflow_ref = "owner/coil/.github/workflows/nightly.yml@refs/heads/main"
+# workflow_ref = "owner/repo/.github/workflows/nightly.yml@refs/heads/main"
 # environment = "nightly-release"
 # event_names = ["schedule", "workflow_dispatch"]
-# scopes = ["coil:nightly:publish"]
-#
-# The release store is always private. Legacy Gatekeeper credentials can read;
-# only the GitHub OIDC identity carrying publish_scope can create a release.
+# scopes = ["releases:publish"]
+
+# A function that serves two kinds of caller. `any_scopes` admits either one and
+# the function tells them apart from `Request::auth()`; `scopes` would demand
+# both at once. `settings` is the function's own configuration — the gate carries
+# this table through verbatim and never reads a field of it. `stream_request`
+# hands the function the request body as a stream, which is what lets a route
+# accept uploads far larger than the gate would hold in memory.
 # [[route]]
-# path = "/coil/v1"
-# release_store = { root = "/var/lib/gatekeeper/releases/coil", read_scope = "coil:read", publish_scope = "coil:nightly:publish", max_artifact_bytes = 536870912, retain_builds = 14 }
+# path = "/releases/v1"
+# any_scopes = ["releases:read", "releases:publish"]
+# function = { library = "/opt/functions/librelease.so", stream_request = true, settings = { root = "/var/lib/gatekeeper/releases", read_scope = "releases:read", publish_scope = "releases:publish", max_artifact_bytes = 536870912, retain_builds = 14 } }

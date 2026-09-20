@@ -42,6 +42,22 @@ impl Reply {
         }
     }
 
+    /// A stream whose total length may or may not be known. A known length is
+    /// framed as `Content-Length`, an unknown one as chunked.
+    pub fn stream_maybe_len(
+        status: u16,
+        length: Option<usize>,
+        body: Box<dyn Read + Send>,
+    ) -> Self {
+        Reply {
+            status,
+            headers: Vec::new(),
+            body: Vec::new(),
+            stream: Some(body),
+            length,
+        }
+    }
+
     pub fn stream_len(status: u16, body: Box<dyn Read + Send>, length: usize) -> Self {
         Reply {
             status,
@@ -74,6 +90,13 @@ impl Reply {
                 None,
             ),
         };
+        // tiny_http chunks anything at or above a 32 KiB threshold even when the
+        // length is known. For a large download that is the wrong trade: a
+        // declared length is what makes `HEAD` report a size and a client resume
+        // a transfer. If we know the length, say it.
+        if self.length.is_some() {
+            resp = resp.with_chunked_threshold(usize::MAX);
+        }
         for (name, value) in &self.headers {
             if let Ok(h) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
                 resp = resp.with_header(h);

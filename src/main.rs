@@ -13,16 +13,15 @@ use std::sync::Arc;
 
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 
-use gatekeeper::auth::{Authenticator, Verifier};
+use gatekeeper::auth::{AuthContext, Authenticator, Verifier};
 use gatekeeper::oidc::GitHubOidcVerifier;
 use gatekeeper::config::{self, Config, Target};
-use gatekeeper::function::FunctionRegistry;
+use gatekeeper::function::{Call, CallBody, FunctionRegistry};
 use gatekeeper::login;
 use gatekeeper::passkey::PasskeyEngine;
 use gatekeeper::proxy;
 use gatekeeper::ratelimit::RateLimiter;
 use gatekeeper::reply::Reply;
-use gatekeeper::release_store::ReleaseStore;
 use gatekeeper::route::{Match, Router};
 use gatekeeper::schedule::Scheduler;
 use gatekeeper::serve;
@@ -526,11 +525,24 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
             };
             // The safety gate: private routes require a valid token.
             if !route.public {
-                let route_scopes_apply = !matches!(target, Target::ReleaseStore(_));
-                if auth.is_none()
-                    || (route_scopes_apply
-                        && !auth.as_ref().is_some_and(|a| a.allows(&route.scopes)))
-                {
+                // All of `scopes`, and at least one of `any_scopes`. With
+                // neither configured this stays `allows(&[])`, which admits only
+                // a credential holding blanket authority — a narrowly scoped
+                // identity such as a GitHub workflow is refused a route that
+                // never named its scope. That rule is why the release store used
+                // to need a carve-out here; `any_scopes` replaces it.
+                let permitted = |a: &AuthContext| match (
+                    route.scopes.is_empty(),
+                    route.any_scopes.is_empty(),
+                ) {
+                    (true, true) => a.allows(&[]),
+                    (false, true) => a.allows(&route.scopes),
+                    (true, false) => a.allows_any(&route.any_scopes),
+                    (false, false) => {
+                        a.allows(&route.scopes) && a.allows_any(&route.any_scopes)
+                    }
+                };
+                if !auth.as_ref().is_some_and(permitted) {
                     let r = browser_login_redirect(
                         request.method().as_str(),
                         request.headers(),
@@ -578,40 +590,49 @@ fn handle(gate: &Gate, mut request: tiny_http::Request) {
                     proxy::forward(&upstream, &method, &raw_url, request.headers(), &body)
                 }
                 Target::Function(function) => {
-                    // Read the body, then invoke the dylib in process. `rest` is
-                    // the path after the route prefix (already normalized); the
-                    // function sees that plus the query separately.
-                    let mut body = Vec::new();
-                    let _ = request.as_reader().read_to_end(&mut body);
+                    // `rest` is the path after the route prefix (already
+                    // normalized); the function sees that plus the query
+                    // separately. A `stream_request` route hands the connection
+                    // straight to the function instead of reading it into the
+                    // gate first, so an upload never sits in this process.
                     let method = request.method().as_str().to_string();
-                    gate.functions.invoke_target(
-                        &function,
-                        &method,
-                        &rest,
-                        &query,
-                        request.headers(),
-                        &body,
-                    )
-                }
-                Target::ReleaseStore(config) => match ReleaseStore::new(config) {
-                    Err(error) => {
-                        eprintln!("gatekeeper: release store initialization failed: {error}");
-                        Reply::status(500, "release store failure")
-                    }
-                    Ok(store) => {
-                        let method = request.method().as_str().to_string();
-                        let headers = request.headers().to_vec();
-                        let length = request.body_length();
-                        store.handle(
-                            auth.as_ref().expect("release stores are private"),
-                            &method,
-                            &rest,
-                            &headers,
-                            length,
-                            request.as_reader(),
+                    let auth_json = auth.as_ref().map(|a| a.to_json()).unwrap_or_default();
+                    let settings = function.settings_json();
+                    let headers = request.headers().to_vec();
+                    if function.stream_request() {
+                        let total = request.body_length().map(|n| n as u64).unwrap_or(u64::MAX);
+                        gate.functions.invoke_target(
+                            &function,
+                            Call {
+                                method: &method,
+                                path: &rest,
+                                query: &query,
+                                headers: &headers,
+                                body: CallBody::Stream {
+                                    reader: request.as_reader(),
+                                    total,
+                                },
+                                auth: &auth_json,
+                                settings: &settings,
+                            },
+                        )
+                    } else {
+                        let mut body = Vec::new();
+                        let _ = request.as_reader().read_to_end(&mut body);
+                        gate.functions.invoke_target(
+                            &function,
+                            Call {
+                                method: &method,
+                                path: &rest,
+                                query: &query,
+                                headers: &headers,
+                                body: CallBody::Buffered(&body),
+                                auth: &auth_json,
+                                settings: &settings,
+                            },
                         )
                     }
-                },
+                }
             }
         }
     };
@@ -714,17 +735,20 @@ fn print_exposure_report(
 }
 
 fn target_desc(r: &config::Route) -> String {
-    match (&r.static_dir, &r.proxy, &r.function, &r.release_store) {
-        (Some(d), _, _, _) => format!("static {}", d.display()),
-        (_, Some(u), _, _) => format!("proxy {u}"),
-        (_, _, Some(function), _) => {
+    match (&r.static_dir, &r.proxy, &r.function) {
+        (Some(d), _, _) => format!("static {}", d.display()),
+        (_, Some(u), _) => format!("proxy {u}"),
+        (_, _, Some(function)) => {
             let lifecycle = match function.lifecycle() {
                 config::FunctionLifecycle::Reloadable => "reloadable",
                 config::FunctionLifecycle::Service => "service",
             };
-            format!("function {} ({lifecycle})", function.library().display())
+            let streaming = if function.stream_request() { ", streaming" } else { "" };
+            format!(
+                "function {} ({lifecycle}{streaming})",
+                function.library().display()
+            )
         }
-        (_, _, _, Some(store)) => format!("release store {}", store.root.display()),
         _ if r.dashboard => "dashboard (built-in index)".into(),
         _ => "(invalid)".into(),
     }
@@ -777,8 +801,6 @@ fn describe_catalog(gate: &Gate, routing: &Routing) -> Reply {
             entry["kind"] = json!("static");
         } else if r.proxy.is_some() {
             entry["kind"] = json!("proxy");
-        } else if r.release_store.is_some() {
-            entry["kind"] = json!("release-store");
         } else if r.dashboard {
             entry["kind"] = json!("dashboard");
         }

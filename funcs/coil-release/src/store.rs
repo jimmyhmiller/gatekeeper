@@ -8,24 +8,60 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::auth::{AuthContext, Principal};
-use crate::config::ReleaseStoreConfig;
-use crate::reply::Reply;
+use gatekeeper_fn::Response;
+
+use crate::caller::{Caller, GitHubClaims, Settings};
 
 const MAX_CONTROL_BODY: u64 = 256 * 1024;
 const MAX_TARGETS: usize = 16;
-static STORE_LOCK: Mutex<()> = Mutex::new(());
+/// Serializes every mutation of the store.
+///
+/// This is an `flock` on a file in the store root rather than a process-global
+/// `Mutex` because this code lives in a dylib the gate may unload and reload: a
+/// mutex belongs to one loaded image, so a reload between two requests would
+/// hand them different locks. A file lock is held by the process, outlives any
+/// image, and the kernel drops it if we die holding it.
+struct StoreLock(File);
+
+impl StoreLock {
+    fn acquire(path: &Path) -> Result<Self, StoreError> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+            .map_err(|e| StoreError::internal("opening store lock", e))?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| StoreError::internal("securing store lock", e))?;
+        // SAFETY: a valid fd we own for the lifetime of `file`.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(StoreError::internal(
+                "locking store",
+                io::Error::last_os_error(),
+            ));
+        }
+        Ok(StoreLock(file))
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        // SAFETY: same fd, still open; the close in `File::drop` would release
+        // the lock anyway, so a failure here is not actionable.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 #[derive(Clone)]
 pub struct ReleaseStore {
-    cfg: ReleaseStoreConfig,
+    cfg: Settings,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,13 +90,42 @@ struct PublicationState {
     identity: PublicationIdentity,
 }
 
+/// The run that owns an open publication, persisted beside it so a resumed
+/// upload can be checked against whoever opened the transaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct PublicationIdentity {
-    repository_id: String,
-    workflow_ref: String,
-    run_id: String,
-    run_attempt: String,
+struct PublicationIdentity(GitHubClaims);
+
+/// One request, as this store needs to see it. A struct rather than six more
+/// parameters on `handle`, for the same reason the gate groups its own: that is
+/// how a call site starts passing the wrong string to the wrong argument.
+pub struct Incoming<'a> {
+    pub method: &'a str,
+    /// Path after the route prefix, already normalized by the gate.
+    pub rest: &'a str,
+    /// Raw query string, without the leading `?`.
+    pub query: &'a str,
+    pub headers: &'a [(String, String)],
+    /// The declared `Content-Length`, checked against what actually arrives.
+    pub body_length: Option<u64>,
+    pub body: &'a mut dyn Read,
+}
+
+/// What a channel currently publishes.
+#[derive(Debug, Clone)]
+struct ChannelHead {
     commit: String,
+    sequence: u64,
+}
+
+/// The channel's ordering rule, stated once. A publication may replace the head
+/// only by naming the head's own commit — completion is idempotent — or by
+/// advancing the sequence. `promote_channel` enforces this and `preflight`
+/// reports it, so the two can never disagree about what would be accepted.
+fn advances_channel(head: Option<&ChannelHead>, commit: &str, sequence: u64) -> bool {
+    match head {
+        None => true,
+        Some(head) => head.commit == commit || sequence > head.sequence,
+    }
 }
 
 #[derive(Debug)]
@@ -80,30 +145,27 @@ impl StoreError {
         eprintln!("gatekeeper: release store: {context}: {error}");
         Self::new(500, "release store failure")
     }
-    fn reply(self) -> Reply {
-        Reply::status(self.status, &self.message)
-            .with_header("Cache-Control", "private, no-store")
-            .with_header("X-Content-Type-Options", "nosniff")
+    fn reply(self) -> Response {
+        Response::status(self.status, self.message)
+            .header("Cache-Control", "private, no-store")
+            .header("X-Content-Type-Options", "nosniff")
     }
 }
 
 impl ReleaseStore {
-    pub fn new(cfg: ReleaseStoreConfig) -> Result<Self, String> {
+    pub fn new(cfg: Settings) -> Result<Self, String> {
         let store = Self { cfg };
         store.ensure_layout().map_err(|e| e.message)?;
         Ok(store)
     }
 
-    pub fn handle(
-        &self,
-        auth: &AuthContext,
-        method: &str,
-        rest: &str,
-        headers: &[tiny_http::Header],
-        body_length: Option<usize>,
-        body: &mut dyn Read,
-    ) -> Reply {
+    pub fn handle(&self, auth: &Caller, request: Incoming<'_>) -> Response {
+        let Incoming { method, rest, query, headers, body_length, body } = request;
         let result = match split_path(rest).as_slice() {
+            ["publications", "preflight"] if method == "GET" => self
+                .require(auth, &self.cfg.publish_scope)
+                .and_then(|_| self.preflight(query))
+                .map(json_reply),
             ["publications"] if method == "POST" => self
                 .require(auth, &self.cfg.publish_scope)
                 .and_then(|_| read_control(body, body_length))
@@ -128,28 +190,78 @@ impl ReleaseStore {
         result.unwrap_or_else(StoreError::reply)
     }
 
-    fn require(&self, auth: &AuthContext, scope: &str) -> Result<(), StoreError> {
-        if auth.allows(&[scope.to_string()]) {
+    fn require(&self, auth: &Caller, scope: &str) -> Result<(), StoreError> {
+        if auth.allows(scope) {
             Ok(())
         } else {
             Err(StoreError::new(403, "Forbidden"))
         }
     }
 
-    fn begin(&self, auth: &AuthContext, bytes: &[u8]) -> Result<serde_json::Value, StoreError> {
+    /// Answer, before a build spends two hours earning a 409, whether publishing
+    /// `commit` to `channel` at `sequence` would do anything.
+    ///
+    /// Three answers, deliberately not two. `current` means the channel already
+    /// publishes this commit and the run has nothing to do; `conflict` means the
+    /// publication could never be accepted. Collapsing them into one boolean
+    /// would turn a misordered channel into a silently green build that never
+    /// publishes again.
+    fn preflight(&self, query: &str) -> Result<serde_json::Value, StoreError> {
+        let params = parse_query(query);
+        let channel = params
+            .get("channel")
+            .ok_or_else(|| StoreError::new(400, "preflight needs a channel"))?;
+        let commit = params
+            .get("commit")
+            .ok_or_else(|| StoreError::new(400, "preflight needs a commit"))?;
+        let sequence: u64 = params
+            .get("sequence")
+            .ok_or_else(|| StoreError::new(400, "preflight needs a sequence"))?
+            .parse()
+            .map_err(|_| StoreError::new(400, "preflight sequence must be a number"))?;
+        validate_segment(channel, "channel")?;
+        validate_commit(commit)?;
+        let _guard = StoreLock::acquire(&self.lock_path())?;
+        let head = self.read_head(channel)?;
+        let (verdict, reason) = if head.as_ref().is_some_and(|h| h.commit == *commit) {
+            (
+                "current",
+                format!("channel {channel} already publishes commit {commit}"),
+            )
+        } else if self.builds().join(commit).exists() {
+            (
+                "conflict",
+                format!("commit {commit} is already published and builds are immutable"),
+            )
+        } else if !advances_channel(head.as_ref(), commit, sequence) {
+            let at = head.as_ref().map(|h| h.sequence).unwrap_or(0);
+            (
+                "conflict",
+                format!("sequence {sequence} does not advance channel {channel} at {at}"),
+            )
+        } else {
+            ("publish", format!("channel {channel} has no build of commit {commit}"))
+        };
+        Ok(serde_json::json!({
+            "channel": channel,
+            "commit": commit,
+            "verdict": verdict,
+            "reason": reason
+        }))
+    }
+
+    fn begin(&self, auth: &Caller, bytes: &[u8]) -> Result<serde_json::Value, StoreError> {
         let request: BeginPublication = serde_json::from_slice(bytes)
             .map_err(|e| StoreError::new(400, format!("invalid publication: {e}")))?;
         validate_begin(&request, self.cfg.max_artifact_bytes)?;
         let identity = publication_identity(auth)?;
-        if identity.commit != request.commit {
+        if identity.0.commit != request.commit {
             return Err(StoreError::new(
                 403,
                 "OIDC commit does not match publication",
             ));
         }
-        let _guard = STORE_LOCK
-            .lock()
-            .map_err(|_| StoreError::new(500, "store lock poisoned"))?;
+        let _guard = StoreLock::acquire(&self.lock_path())?;
         self.ensure_layout()?;
         let id = uuid::Uuid::new_v4().simple().to_string();
         let dir = self.staging().join(&id);
@@ -165,18 +277,16 @@ impl ReleaseStore {
 
     fn upload(
         &self,
-        auth: &AuthContext,
+        auth: &Caller,
         id: &str,
         target: &str,
-        body_length: Option<usize>,
+        body_length: Option<u64>,
         body: &mut dyn Read,
     ) -> Result<serde_json::Value, StoreError> {
         validate_segment(id, "publication id")?;
         validate_target(target)?;
         let identity = publication_identity(auth)?;
-        let _guard = STORE_LOCK
-            .lock()
-            .map_err(|_| StoreError::new(500, "store lock poisoned"))?;
+        let _guard = StoreLock::acquire(&self.lock_path())?;
         let state = self.read_state(id)?;
         require_same_identity(&state.identity, &identity)?;
         let spec = state
@@ -184,7 +294,7 @@ impl ReleaseStore {
             .targets
             .get(target)
             .ok_or_else(|| StoreError::new(404, "undeclared target"))?;
-        if body_length.map(|n| n as u64) != Some(spec.size) {
+        if body_length != Some(spec.size) {
             return Err(StoreError::new(
                 400,
                 "Content-Length does not match declaration",
@@ -230,12 +340,10 @@ impl ReleaseStore {
         Ok(serde_json::json!({ "target": target, "state": "uploaded" }))
     }
 
-    fn complete(&self, auth: &AuthContext, id: &str) -> Result<serde_json::Value, StoreError> {
+    fn complete(&self, auth: &Caller, id: &str) -> Result<serde_json::Value, StoreError> {
         validate_segment(id, "publication id")?;
         let identity = publication_identity(auth)?;
-        let _guard = STORE_LOCK
-            .lock()
-            .map_err(|_| StoreError::new(500, "store lock poisoned"))?;
+        let _guard = StoreLock::acquire(&self.lock_path())?;
         let state = self.read_state(id)?;
         require_same_identity(&state.identity, &identity)?;
         let stage = self.staging().join(id);
@@ -302,24 +410,36 @@ impl ReleaseStore {
         request: &BeginPublication,
         manifest: &serde_json::Value,
     ) -> Result<(), StoreError> {
-        let path = self.channels().join(format!("{}.json", request.channel));
-        if path.exists() {
-            let current: serde_json::Value = read_json_bounded(&path)?;
-            let current_commit = current.get("commit").and_then(|v| v.as_str());
-            let current_sequence = current
-                .get("sequence")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            if current_commit != Some(request.commit.as_str())
-                && request.sequence <= current_sequence
-            {
-                return Err(StoreError::new(409, "channel sequence must increase"));
-            }
+        let head = self.read_head(&request.channel)?;
+        if !advances_channel(head.as_ref(), &request.commit, request.sequence) {
+            return Err(StoreError::new(409, "channel sequence must increase"));
         }
-        write_json_atomic(&path, manifest)
+        write_json_atomic(
+            &self.channels().join(format!("{}.json", request.channel)),
+            manifest,
+        )
     }
 
-    fn channel(&self, file: &str, head: bool) -> Result<Reply, StoreError> {
+    /// The identity of what a channel currently publishes, or None if it has
+    /// never published. Both the ordering rule and preflight read it here so
+    /// they cannot disagree about what the head is.
+    fn read_head(&self, channel: &str) -> Result<Option<ChannelHead>, StoreError> {
+        let path = self.channels().join(format!("{channel}.json"));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let current: serde_json::Value = read_json_bounded(&path)?;
+        Ok(Some(ChannelHead {
+            commit: current
+                .get("commit")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            sequence: current.get("sequence").and_then(|v| v.as_u64()).unwrap_or(0),
+        }))
+    }
+
+    fn channel(&self, file: &str, head: bool) -> Result<Response, StoreError>  {
         let channel = file
             .strip_suffix(".json")
             .ok_or_else(|| StoreError::new(404, "Not Found"))?;
@@ -337,8 +457,8 @@ impl ReleaseStore {
         commit: &str,
         file: &str,
         head: bool,
-        headers: &[tiny_http::Header],
-    ) -> Result<Reply, StoreError> {
+        headers: &[(String, String)],
+    ) -> Result<Response, StoreError>  {
         validate_commit(commit)?;
         if !file.starts_with("coil-") || !file.ends_with(".tar.gz") {
             return Err(StoreError::new(404, "Not Found"));
@@ -359,7 +479,7 @@ impl ReleaseStore {
         head: bool,
         range: Option<&str>,
         content_type: &str,
-    ) -> Result<Reply, StoreError> {
+    ) -> Result<Response, StoreError>  {
         let meta = fs::symlink_metadata(&path).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => StoreError::new(404, "Not Found"),
             _ => StoreError::internal("reading artifact metadata", e),
@@ -385,13 +505,15 @@ impl ReleaseStore {
         } else {
             Box::new(file.take(length))
         };
-        let mut reply = Reply::stream_len(status, body, length as usize)
-            .with_header("Content-Type", content_type)
-            .with_header("Cache-Control", "private, no-store")
-            .with_header("Accept-Ranges", "bytes")
-            .with_header("X-Content-Type-Options", "nosniff");
+        // The length is declared, not chunked: a client resuming a download or
+        // asking HEAD for a size needs a real Content-Length.
+        let mut reply = Response::stream_len(status, body, length)
+            .header("Content-Type", content_type)
+            .header("Cache-Control", "private, no-store")
+            .header("Accept-Ranges", "bytes")
+            .header("X-Content-Type-Options", "nosniff");
         if status == 206 {
-            reply = reply.with_header("Content-Range", &format!("bytes {start}-{end}/{total}"));
+            reply = reply.header("Content-Range", format!("bytes {start}-{end}/{total}"));
         }
         Ok(reply)
     }
@@ -416,6 +538,9 @@ impl ReleaseStore {
     }
     fn staging(&self) -> PathBuf {
         self.cfg.root.join("staging")
+    }
+    fn lock_path(&self) -> PathBuf {
+        self.cfg.root.join(".lock")
     }
 
     fn collect_old_builds(&self) -> Result<(), StoreError> {
@@ -457,16 +582,13 @@ impl ReleaseStore {
     }
 }
 
-fn publication_identity(auth: &AuthContext) -> Result<PublicationIdentity, StoreError> {
-    match &auth.principal {
-        Principal::GitHubActions(p) => Ok(PublicationIdentity {
-            repository_id: p.repository_id.clone(),
-            workflow_ref: p.workflow_ref.clone(),
-            run_id: p.run_id.clone(),
-            run_attempt: p.run_attempt.clone(),
-            commit: p.commit.clone(),
-        }),
-        _ => Err(StoreError::new(403, "GitHub OIDC identity required")),
+/// A publication is bound to the workflow run that opened it. The claims come
+/// from the gate, which verified the OIDC token — the function trusts them for
+/// exactly that reason and would have no way to check them itself.
+fn publication_identity(auth: &Caller) -> Result<PublicationIdentity, StoreError> {
+    match auth.github() {
+        Some(claims) => Ok(PublicationIdentity(claims.clone())),
+        None => Err(StoreError::new(403, "GitHub OIDC identity required")),
     }
 }
 
@@ -581,14 +703,11 @@ fn hash_file(path: &Path) -> Result<(u64, String), StoreError> {
     Ok((total, hex(&hash.finalize())))
 }
 
-fn read_control(body: &mut dyn Read, length: Option<usize>) -> Result<Vec<u8>, StoreError> {
-    if length
-        .map(|n| n as u64)
-        .is_none_or(|n| n > MAX_CONTROL_BODY)
-    {
+fn read_control(body: &mut dyn Read, length: Option<u64>) -> Result<Vec<u8>, StoreError> {
+    let Some(declared) = length.filter(|n| *n <= MAX_CONTROL_BODY) else {
         return Err(StoreError::new(411, "bounded Content-Length required"));
-    }
-    let mut bytes = Vec::with_capacity(length.unwrap());
+    };
+    let mut bytes = Vec::with_capacity(declared as usize);
     body.take(MAX_CONTROL_BODY + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| StoreError::internal("reading control request", e))?;
@@ -689,6 +808,17 @@ fn parse_range(raw: &str, total: u64) -> Result<(u64, u64), StoreError> {
     Ok((start, end))
 }
 
+/// Parse a flat `a=b&c=d` query. Percent-decoding is deliberately absent: every
+/// value this route accepts is validated to a restricted alphabet anyway, and a
+/// decoder here would only widen what reaches those validators.
+fn parse_query(query: &str) -> BTreeMap<&str, &str> {
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .filter(|(key, value)| !key.is_empty() && !value.is_empty())
+        .collect()
+}
+
 fn split_path(rest: &str) -> Vec<&str> {
     rest.trim_matches('/')
         .split('/')
@@ -740,41 +870,40 @@ fn artifact_name(target: &str) -> String {
     format!("coil-{target}.tar.gz")
 }
 
-fn header<'a>(headers: &'a [tiny_http::Header], name: &str) -> Option<&'a str> {
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
     headers
         .iter()
-        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
-        .map(|h| h.value.as_str())
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn json_reply(value: serde_json::Value) -> Reply {
-    Reply::new(200, serde_json::to_vec(&value).unwrap())
-        .with_header("Content-Type", "application/json")
-        .with_header("Cache-Control", "private, no-store")
-        .with_header("X-Content-Type-Options", "nosniff")
+fn json_reply(value: serde_json::Value) -> Response {
+    Response::new(200, serde_json::to_vec(&value).unwrap())
+        .header("Content-Type", "application/json")
+        .header("Cache-Control", "private, no-store")
+        .header("X-Content-Type-Options", "nosniff")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn publisher(commit: &str, run: &str) -> AuthContext {
-        AuthContext {
-            principal: Principal::GitHubActions(crate::oidc::GitHubPrincipal {
-                policy: "coil-nightly".into(),
+    fn publisher(commit: &str, run: &str) -> Caller {
+        Caller {
+            principal: "github-actions".into(),
+            scopes: vec!["coil:nightly:publish".into()],
+            claims: Some(GitHubClaims {
                 repository_id: "123".into(),
-                repository_owner_id: "456".into(),
                 workflow_ref: "jimmyhmiller/coil/.github/workflows/nightly.yml@refs/heads/main"
                     .into(),
                 run_id: run.into(),
                 run_attempt: "1".into(),
                 commit: commit.into(),
             }),
-            scopes: vec!["coil:nightly:publish".into()],
         }
     }
 
@@ -783,7 +912,7 @@ mod tests {
             "gatekeeper-release-store-test-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let store = ReleaseStore::new(ReleaseStoreConfig {
+        let store = ReleaseStore::new(Settings {
             root: root.clone(),
             read_scope: "coil:read".into(),
             publish_scope: "coil:nightly:publish".into(),
@@ -853,7 +982,7 @@ mod tests {
                 &auth,
                 id,
                 "aarch64-apple-darwin",
-                Some(bytes.len()),
+                Some(bytes.len() as u64),
                 &mut io::Cursor::new(bytes),
             )
             .unwrap();
@@ -868,6 +997,135 @@ mod tests {
                 .unwrap(),
             bytes
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Publish one commit at `sequence`, then read preflight's verdict for
+    /// `(commit, sequence)` back out of the full request path.
+    fn published_store() -> (ReleaseStore, PathBuf, String) {
+        let (store, root) = test_store();
+        let commit = "3".repeat(40);
+        let bytes = b"published toolchain";
+        let request = serde_json::json!({
+            "schema": 1,
+            "channel": "nightly",
+            "release": "nightly-test",
+            "commit": commit,
+            "sequence": 100,
+            "published_at": "2026-09-12T00:00:00Z",
+            "targets": {
+                "aarch64-apple-darwin": {
+                    "sha256": hex(&Sha256::digest(bytes)), "size": bytes.len()
+                }
+            }
+        });
+        let auth = publisher(&commit, "88");
+        let begun = store
+            .begin(&auth, &serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        let id = begun["publication"].as_str().unwrap().to_string();
+        store
+            .upload(
+                &auth,
+                &id,
+                "aarch64-apple-darwin",
+                Some(bytes.len() as u64),
+                &mut io::Cursor::new(bytes),
+            )
+            .unwrap();
+        store.complete(&auth, &id).unwrap();
+        (store, root, commit)
+    }
+
+    fn verdict(store: &ReleaseStore, auth: &Caller, commit: &str, sequence: u64) -> String {
+        let reply = store.handle(
+            auth,
+            Incoming {
+                method: "GET",
+                rest: "/publications/preflight",
+                query: &format!("channel=nightly&commit={commit}&sequence={sequence}"),
+                headers: &[],
+                body_length: None,
+                body: &mut io::empty(),
+            },
+        );
+        assert_eq!(reply.status_code(), 200);
+        let body: serde_json::Value = serde_json::from_slice(reply.body_bytes()).unwrap();
+        body["verdict"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn preflight_separates_nothing_to_do_from_cannot_publish() {
+        let (store, root, published) = published_store();
+        let auth = publisher(&published, "99");
+        // The commit the channel already publishes: the run has nothing to do.
+        assert_eq!(verdict(&store, &auth, &published, 101), "current");
+        // A newer commit that advances the channel: build it.
+        let next = "4".repeat(40);
+        assert_eq!(verdict(&store, &auth, &next, 101), "publish");
+        // A newer commit that does not advance the channel could never be
+        // completed, so it must be loud rather than another quiet skip.
+        assert_eq!(verdict(&store, &auth, &next, 100), "conflict");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preflight_agrees_with_the_completion_it_predicts() {
+        let (store, root, published) = published_store();
+        let commit = "5".repeat(40);
+        let auth = publisher(&commit, "99");
+        assert_eq!(verdict(&store, &auth, &commit, 100), "conflict");
+        // The rule preflight reported is the one completion enforces.
+        let request = serde_json::json!({
+            "schema": 1,
+            "channel": "nightly",
+            "release": "nightly-test",
+            "commit": commit,
+            "sequence": 100,
+            "published_at": "2026-09-12T00:00:00Z",
+            "targets": { "aarch64-apple-darwin": { "sha256": hex(&Sha256::digest(b"x")), "size": 1 } }
+        });
+        let begun = store
+            .begin(&auth, &serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        let id = begun["publication"].as_str().unwrap().to_string();
+        store
+            .upload(&auth, &id, "aarch64-apple-darwin", Some(1), &mut io::Cursor::new(b"x"))
+            .unwrap();
+        let error = store.complete(&auth, &id).unwrap_err();
+        assert_eq!(error.status, 409);
+        assert_eq!(error.message, "channel sequence must increase");
+        assert_ne!(published, commit);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn preflight_needs_the_publish_scope_and_a_complete_question() {
+        let (store, root) = test_store();
+        let commit = "6".repeat(40);
+        let mut reader = publisher(&commit, "1");
+        reader.scopes = vec!["coil:read".into()];
+        let ask = |auth: &Caller, query: &str| {
+            store
+                .handle(
+                    auth,
+                    Incoming {
+                        method: "GET",
+                        rest: "/publications/preflight",
+                        query,
+                        headers: &[],
+                        body_length: None,
+                        body: &mut io::empty(),
+                    },
+                )
+                .status_code()
+        };
+        let full = format!("channel=nightly&commit={commit}&sequence=1");
+        assert_eq!(ask(&reader, &full), 403);
+        assert_eq!(ask(&publisher(&commit, "1"), &full), 200);
+        // A question the store cannot answer completely is refused, never guessed.
+        assert_eq!(ask(&publisher(&commit, "1"), &format!("channel=nightly&commit={commit}")), 400);
+        assert_eq!(ask(&publisher(&commit, "1"), "channel=nightly&commit=nope&sequence=1"), 400);
         fs::remove_dir_all(root).unwrap();
     }
 

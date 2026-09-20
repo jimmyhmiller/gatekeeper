@@ -240,21 +240,21 @@ mod tests {
 
     fn policy() -> GitHubOidcPolicy {
         GitHubOidcPolicy {
-            name: "coil-nightly".into(),
+            name: "example-nightly".into(),
             repository_id: "123".into(),
             repository_owner_id: "456".into(),
             r#ref: "refs/heads/main".into(),
-            workflow_ref: "jimmyhmiller/coil/.github/workflows/nightly.yml@refs/heads/main".into(),
+            workflow_ref: "acme/widgets/.github/workflows/nightly.yml@refs/heads/main".into(),
             environment: Some("nightly-release".into()),
             event_names: vec!["schedule".into(), "workflow_dispatch".into()],
-            scopes: vec!["coil:nightly:publish".into()],
+            scopes: vec!["releases:publish".into()],
         }
     }
 
     fn claims() -> Claims {
         Claims {
             iss: "https://token.actions.githubusercontent.com".into(),
-            aud: Audience::One("https://computer.example/coil/releases".into()),
+            aud: Audience::One("https://gate.example/releases".into()),
             exp: u64::MAX,
             iat: u64::MAX - 60,
             nbf: None,

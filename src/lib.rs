@@ -10,7 +10,6 @@ pub mod passkey;
 pub mod proxy;
 pub mod ratelimit;
 pub mod reply;
-pub mod release_store;
 pub mod route;
 pub mod schedule;
 pub mod serve;
